@@ -22,24 +22,41 @@ and can be refined later.
 """
 
 
-GENERATION_MODEL = "gpt-5.1-mini"
-SCORING_MODEL = "gpt-5.1-mini"
+GENERATION_MODEL = "gpt-5"
+SCORING_MODEL = "gpt-5"
 META_MODEL = "gpt-5.1"
-N_GENERATION_WORKERS = 8
 
 MODEL_PRICING = {
     # Prices in USD per token (converted from USD per million tokens)
+    # Values pulled from OpenAI pricing page (Nov 2025).
     "gpt-5.1": {
         "input": 1.25 / 1_000_000,
         "output": 10.0 / 1_000_000,
         "cached_input": 0.125 / 1_000_000,
     },
-    "gpt-5.1-mini": {
+    "gpt-5": {
+        "input": 1.00 / 1_000_000,
+        "output": 8.00 / 1_000_000,
+        "cached_input": 0.10 / 1_000_000,
+    },
+    "gpt-5-mini": {
         "input": 0.25 / 1_000_000,
         "output": 2.0 / 1_000_000,
         "cached_input": 0.025 / 1_000_000,
     },
 }
+
+
+def _lookup_pricing_model(model: str) -> Dict[str, float] | None:
+    pricing = MODEL_PRICING.get(model)
+    if pricing:
+        return pricing
+    # Try prefix match to cover snapshot names like "gpt-5.1-2025-11-13"
+    for key, value in MODEL_PRICING.items():
+        if model.startswith(key):
+            return value
+    return None
+
 
 _ENCODER_CACHE: Dict[str, tiktoken.Encoding] = {}
 
@@ -64,6 +81,10 @@ def _count_message_tokens(messages: List[Dict[str, str]], model: str) -> int:
     return sum(_count_text_tokens(message["content"], model) for message in messages)
 
 
+def _progress(message: str) -> None:
+    print(f"[feedback] {message}", file=sys.stderr)
+
+
 def _generation_user_prompt(paper_text: str, worker_id: int) -> str:
     return f"""
 You review the paper text below and provide exactly one feedback proposal.
@@ -83,6 +104,8 @@ Requirements for the feedback proposal:
 - Reference at least one concrete element of the text (for example, a section, claim, figure, or type of analysis).
 - Use neutral, precise, and technical language.
 - Make the proposal directly actionable if possible.
+- Style: whenever possible, frame your feedback as a constructive, inquisitive question (e.g., "I'm wondering if...")
+- Do not request additional sections; instead, provide the best possible guidance given the excerpt.
 - Do not request additional sections; instead, provide the best possible guidance given the excerpt.
 
 Return a JSON object with fields:
@@ -97,14 +120,19 @@ Paper text:
 
 
 GENERATION_SYSTEM_PROMPT = (
-    "You are an expert reviewer for quantitative social science papers. "
-    "You produce a single, concise, high-impact feedback proposal."
+    "You are part of a multidisciplinary review panel for social science manuscripts. "
+    "Follow any persona instructions provided to focus your expertise on the most impactful feedback."
 )
 
 
-def _generation_messages(paper_text: str, worker_id: int) -> List[Dict[str, str]]:
+def _generation_messages(
+    persona_prompt: str,
+    paper_text: str,
+    worker_id: int,
+) -> List[Dict[str, str]]:
+    system_prompt = persona_prompt or GENERATION_SYSTEM_PROMPT
     return [
-        {"role": "system", "content": GENERATION_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": _generation_user_prompt(paper_text, worker_id)},
     ]
 
@@ -119,7 +147,11 @@ You receive the paper text and one feedback proposal.
 
 Assign four integer scores from 1 to 5:
 - "importance": impact of the feedback on improving the paper.
-- "specificity": degree of grounding in concrete, identifiable parts of the text.
+- "specificity": degree of grounding in the text.
+  - For empirical feedback this means referencing a specific table, result, or method section.
+  - For conceptual or logical feedback this means referencing a specific claim, argument, or unstated assumption.
+  - Critically, rate conceptual feedback as highly specific (4 or 5) when it pinpoints a real argumentative gap,
+    even if the reasoning is abstract.
 - "actionability": clarity of what the author should change based on this feedback.
 - "uniqueness": distinctiveness relative to typical comments on such papers.
 
@@ -163,9 +195,48 @@ def _scoring_messages(
     ]
 
 
+CRITIC_SYSTEM_PROMPT = (
+    "You are an expert reviewer acting as a discussant. Your job is to scrutinize a colleague's "
+    "feedback, identify flaws or gaps, and suggest substantive improvements. Be concise but candid."
+)
+
+
+def _critic_user_prompt(paper_text: str, proposal: Dict[str, Any]) -> str:
+    proposal_json = json.dumps(proposal, ensure_ascii=False, separators=(",", ":"))
+    return f"""
+You receive the paper text and one high-quality feedback proposal that another reviewer wrote.
+
+Your task is to critique or significantly improve this proposal.
+- Point out logical flaws, misinterpretations, or missing context.
+- Suggest sharper, more precise guidance when possible.
+- If the proposal is already excellent, say so explicitly.
+
+Return a JSON object:
+- "original_id": {proposal.get("id")}
+- "critique_text": your 1-2 sentence critique or improvement.
+
+Paper text:
+```text
+{paper_text}
+```
+
+Proposal to critique:
+```json
+{proposal_json}
+```""".strip()
+
+
+def _critic_messages(paper_text: str, proposal: Dict[str, Any]) -> List[Dict[str, str]]:
+    return [
+        {"role": "system", "content": CRITIC_SYSTEM_PROMPT},
+        {"role": "user", "content": _critic_user_prompt(paper_text, proposal)},
+    ]
+
+
 META_SYSTEM_PROMPT = (
-    "You are writing a concise meta-review that synthesizes selected "
-    "feedback proposals on a quantitative social science paper."
+    "You are a collegial senior researcher composing first-pass reading notes for the authors. "
+    "Adopt an inquisitive, constructive tone—more like a mentoring email than a formal review. "
+    "You synthesize the junior specialists' proposals into a clear, actionable set of insights."
 )
 
 
@@ -186,7 +257,7 @@ def _meta_messages(selection: Dict[str, Any]) -> List[Dict[str, str]]:
         for dim, plist in selection["by_dimension"].items()
     }
 
-    top_global = selection["sorted"][:TOP_K]
+    top_global = selection.get("sorted_by_composite", [])[:TOP_K]
     top_global_payload = [
         {
             "id": p["id"],
@@ -195,6 +266,32 @@ def _meta_messages(selection: Dict[str, Any]) -> List[Dict[str, str]]:
             "composite": p["composite"],
         }
         for p in top_global
+    ]
+
+    unique_payload = [
+        {
+            "id": p["id"],
+            "dimension": p["dimension"],
+            "text": p["text"],
+            "uniqueness": p["uniqueness"],
+            "composite": p["composite"],
+        }
+        for p in selection.get("sorted_by_uniqueness", [])[:TOP_K]
+    ]
+
+    critiques_payload = selection.get("critiques", [])
+    all_high_quality_payload = [
+        {
+            "id": p["id"],
+            "dimension": p["dimension"],
+            "text": p["text"],
+            "importance": p["importance"],
+            "specificity": p["specificity"],
+            "actionability": p["actionability"],
+            "uniqueness": p["uniqueness"],
+            "composite": p["composite"],
+        }
+        for p in selection.get("high_quality", [])
     ]
 
     user_content = f"""
@@ -216,20 +313,42 @@ For each section:
 - If there are proposals for that dimension, write 2–3 sentences that integrate their content and provide directly actionable guidance.
 - If there are no proposals for that dimension, write 1–2 sentences indicating that no major issues were flagged there.
 
-Then provide a numbered list of the three most important revisions across all dimensions, ordered from most to least important. Base this list primarily on the globally strongest proposals, but you may merge or rephrase them for clarity.
+Consider both the globally strongest proposals and the most unique proposals so that high-impact but novel insights are not overlooked.
+
+Before writing the final list, perform an explicit prioritization step:
+- Review all high-quality proposals below.
+- Balance two goals: (1) conceptual/logical soundness (theory, assumptions, alternative explanations) and (2) empirical validity (identification, statistical interpretation).
+- Select the three to five most important revisions (default to three unless additional issues are truly distinct). You MUST include at least one conceptual/logical flaw if any such proposals exist. Do not simply choose the empirically strongest points.
+
+Then provide a numbered list of the prioritized revisions, ordered from most to least important. Base this list primarily on your balanced prioritization, weaving in unique proposals when they surface distinct, valuable issues. Use an inquisitive tone where appropriate.
 
 High-quality proposals by dimension:
 ```json
 {json.dumps(by_dim_payload)}
 
-Globally strongest proposals:
+Globally strongest proposals (by composite score):
 {json.dumps(top_global_payload)}
-```""".strip()
+
+Most unique proposals (by uniqueness score):
+{json.dumps(unique_payload)}
+
+Critiques from discussant reviewers:
+{json.dumps(critiques_payload)}
+
+All high-quality proposals (for prioritization):
+{json.dumps(all_high_quality_payload)}
+```
+
+Crucially, for each prioritized revision, include a one-sentence justification explaining why it was prioritized (impact, logical priority, or risk). For example:
+1. [Revision text?] *Justification: Addresses a foundational gap in the paper's core argument.*
+2. [Revision text?] *Justification: Resolves a critical interpretive error in the main empirical claim.*
+""".strip()
 
     return [
         {"role": "system", "content": META_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
+
 
 client = AsyncOpenAI()  # Requires OPENAI_API_KEY in environment
 
@@ -245,6 +364,54 @@ DIMENSIONS = [
     "interpretation",
     "writing_structure",
 ]
+
+PERSONA_THEORIST = (
+    "You are a senior social theorist and logician. Your only mandate is to uncover foundational flaws "
+    "in the paper's conceptual framework, central argument, and unstated assumptions. Prioritize the "
+    "'contribution' and 'logical_soundness' dimensions.\n"
+    "CRITICAL INSTRUCTION: You are forbidden from discussing specific econometric techniques, identification "
+    "strategies, robustness checks, or statistical diagnostics. Stay entirely focused on the theory, logic, "
+    "and framing of the research question.\n"
+    "Good example: 'Are these policies really a form of adaptation, or merely delaying pain? The paper should "
+    "define this premise more explicitly.'"
+)
+
+PERSONA_RIVAL = (
+    "You are a rival researcher probing the paper's interpretation. Your job is to surface rival hypotheses, "
+    "alternative mechanisms, omitted contextual factors, or selection effects that could also explain the "
+    "reported outcomes. Concentrate on the 'interpretation' dimension and avoid dwelling on statistical "
+    "implementation details.\n"
+    "Good example: 'Could the null effect in high-stress areas simply reflect that residents there already rely "
+    "on last-resort insurance plans and thus are insulated from the policy?'"
+)
+
+PERSONA_METHODOLOGIST = (
+    "You are a quantitative methodologist. Scrutinize empirical design choices, identification clarity, and the "
+    "interpretation of statistical evidence. Focus on 'logical_soundness' when it pertains to methods and on "
+    "'interpretation' when data usage or diagnostics are at stake. Do not comment on prose quality or high-level theory."
+)
+
+PERSONA_EDITOR = (
+    "You are a senior journal editor evaluating clarity, organization, and narrative structure. Concentrate on the "
+    "'writing_structure' dimension and resist the temptation to critique statistical methods or theoretical framing."
+)
+
+WORKER_ASSIGNMENTS: List[Dict[str, str]] = [
+    {"id": 1, "persona": PERSONA_THEORIST},
+    {"id": 2, "persona": PERSONA_THEORIST},
+    {"id": 3, "persona": PERSONA_THEORIST},
+    {"id": 4, "persona": PERSONA_RIVAL},
+    {"id": 5, "persona": PERSONA_RIVAL},
+    {"id": 6, "persona": PERSONA_METHODOLOGIST},
+    {"id": 7, "persona": PERSONA_METHODOLOGIST},
+    {"id": 8, "persona": PERSONA_EDITOR},
+]
+
+PERSONA_LOOKUP = {
+    assignment["id"]: assignment["persona"] for assignment in WORKER_ASSIGNMENTS
+}
+
+N_GENERATION_WORKERS = len(WORKER_ASSIGNMENTS)
 
 
 # -------------------------------------------------------------------
@@ -271,20 +438,28 @@ async def chat_json(
 # -------------------------------------------------------------------
 
 
-async def generate_single_proposal(paper_text: str, worker_id: int) -> Dict[str, Any]:
-    messages = _generation_messages(paper_text, worker_id)
+async def generate_single_proposal(
+    paper_text: str,
+    worker_id: int,
+    persona_prompt: str,
+) -> Dict[str, Any]:
+    messages = _generation_messages(persona_prompt, paper_text, worker_id)
     result = await chat_json(messages)
     result["id"] = worker_id  # enforce id
+    result["persona"] = persona_prompt
     return result
 
 
 async def generate_all_proposals(
     paper_text: str,
-    n_workers: int = N_GENERATION_WORKERS,
 ) -> List[Dict[str, Any]]:
     tasks = [
-        generate_single_proposal(paper_text, worker_id=i)
-        for i in range(1, n_workers + 1)
+        generate_single_proposal(
+            paper_text,
+            worker_id=assignment["id"],
+            persona_prompt=assignment["persona"],
+        )
+        for assignment in WORKER_ASSIGNMENTS
     ]
     proposals = await asyncio.gather(*tasks)
     return proposals
@@ -329,7 +504,7 @@ async def score_all_proposals(
         S = s["specificity"]
         A = s["actionability"]
         U = s["uniqueness"]
-        composite = 0.4 * I + 0.3 * S + 0.2 * A + 0.1 * U
+        composite = 0.35 * I + 0.25 * S + 0.20 * A + 0.20 * U
         s["composite"] = composite
 
     return scored
@@ -337,30 +512,59 @@ async def score_all_proposals(
 
 # -------------------------------------------------------------------
 # 3. Deterministic selection, ranking, thresholds
+#    + Delphi-style critique round helpers
 # -------------------------------------------------------------------
+
+
+async def critique_single_proposal(
+    paper_text: str,
+    proposal: Dict[str, Any],
+) -> Dict[str, Any]:
+    messages = _critic_messages(paper_text, proposal)
+    critique = await chat_json(messages, model=GENERATION_MODEL)
+    critique["original_id"] = proposal.get("id")
+    return critique
+
+
+async def run_critique_round(
+    paper_text: str,
+    proposals_to_critique: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    if not proposals_to_critique:
+        return []
+    tasks = [critique_single_proposal(paper_text, p) for p in proposals_to_critique]
+    critiques = await asyncio.gather(*tasks)
+    return critiques
 
 
 def select_and_classify(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
     # Sort by composite, descending
-    sorted_scored = sorted(scored, key=lambda x: x["composite"], reverse=True)
+    sorted_by_composite = sorted(scored, key=lambda x: x["composite"], reverse=True)
 
-    # Top K
-    top_proposals = sorted_scored[:TOP_K]
+    # Top K by composite
+    top_proposals = sorted_by_composite[:TOP_K]
 
     # Low-value proposals
     low_value_ids = [
         p["id"]
-        for p in sorted_scored
+        for p in sorted_by_composite
         if p["importance"] <= 2 or p["actionability"] <= 2
     ]
 
     # High-quality proposals for meta-review
     high_quality = [
         p
-        for p in sorted_scored
+        for p in sorted_by_composite
         if (p["composite"] >= COMPOSITE_THRESHOLD)
         or (p["importance"] >= IMPORTANCE_THRESHOLD)
     ]
+
+    # Also rank high-quality proposals by uniqueness to surface novel ideas
+    sorted_by_uniqueness = sorted(
+        high_quality,
+        key=lambda x: x["uniqueness"],
+        reverse=True,
+    )
 
     # Group high-quality proposals by dimension
     by_dimension = {dim: [] for dim in DIMENSIONS}
@@ -370,7 +574,8 @@ def select_and_classify(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
             by_dimension[dim].append(p)
 
     selection = {
-        "sorted": sorted_scored,
+        "sorted_by_composite": sorted_by_composite,
+        "sorted_by_uniqueness": sorted_by_uniqueness,
         "top_proposals": top_proposals,
         "low_value_ids": low_value_ids,
         "high_quality": high_quality,
@@ -403,13 +608,10 @@ def _stage_cost_summary(
     completion_tokens: int,
     model: str,
 ) -> Dict[str, Any]:
-    pricing = MODEL_PRICING.get(model)
+    pricing = _lookup_pricing_model(model)
     cost = None
     if pricing:
-        cost = (
-            prompt_tokens * pricing["input"]
-            + completion_tokens * pricing["output"]
-        )
+        cost = prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]
     total_tokens = prompt_tokens + completion_tokens
     return {
         "model": model,
@@ -428,7 +630,8 @@ def _estimate_generation_tokens(
     completion_tokens = 0
     for proposal in proposals:
         worker_id = proposal.get("id", 0)
-        messages = _generation_messages(paper_text, worker_id)
+        persona_prompt = PERSONA_LOOKUP.get(worker_id, GENERATION_SYSTEM_PROMPT)
+        messages = _generation_messages(persona_prompt, paper_text, worker_id)
         prompt_tokens += _count_message_tokens(messages, GENERATION_MODEL)
         completion_tokens += _count_text_tokens(
             json.dumps(
@@ -473,6 +676,35 @@ def _estimate_scoring_tokens(
     return prompt_tokens, completion_tokens
 
 
+def _estimate_critique_tokens(
+    paper_text: str,
+    high_quality: List[Dict[str, Any]],
+    critiques: List[Dict[str, Any]],
+) -> Tuple[int, int]:
+    if not high_quality:
+        return 0, 0
+    prompt_tokens = 0
+    completion_tokens = 0
+    critique_by_id = {c.get("original_id"): c for c in critiques}
+    for proposal in high_quality:
+        messages = _critic_messages(paper_text, proposal)
+        prompt_tokens += _count_message_tokens(messages, GENERATION_MODEL)
+        critique = critique_by_id.get(proposal.get("id"))
+        if critique:
+            completion_tokens += _count_text_tokens(
+                json.dumps(
+                    {
+                        "original_id": critique.get("original_id"),
+                        "critique_text": critique.get("critique_text"),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                GENERATION_MODEL,
+            )
+    return prompt_tokens, completion_tokens
+
+
 def _estimate_meta_tokens(
     selection: Dict[str, Any],
     meta_review_text: str,
@@ -496,16 +728,29 @@ def estimate_pipeline_cost(
 
     gen_prompt, gen_completion = _estimate_generation_tokens(paper_text, proposals)
     score_prompt, score_completion = _estimate_scoring_tokens(paper_text, scored)
+    critiques = selection.get("critiques", [])
+    critique_prompt, critique_completion = _estimate_critique_tokens(
+        paper_text,
+        selection.get("high_quality", []),
+        critiques,
+    )
     meta_prompt, meta_completion = _estimate_meta_tokens(selection, meta_review_text)
 
     stages = {
         "generation": _stage_cost_summary(gen_prompt, gen_completion, GENERATION_MODEL),
         "scoring": _stage_cost_summary(score_prompt, score_completion, SCORING_MODEL),
+        "critiques": _stage_cost_summary(
+            critique_prompt,
+            critique_completion,
+            GENERATION_MODEL,
+        ),
         "meta_review": _stage_cost_summary(meta_prompt, meta_completion, META_MODEL),
     }
 
     total_prompt_tokens = sum(stage["prompt_tokens"] for stage in stages.values())
-    total_completion_tokens = sum(stage["completion_tokens"] for stage in stages.values())
+    total_completion_tokens = sum(
+        stage["completion_tokens"] for stage in stages.values()
+    )
     total_cost = sum((stage["cost_usd"] or 0.0) for stage in stages.values())
 
     return {
@@ -524,9 +769,20 @@ def estimate_pipeline_cost(
 
 async def full_feedback_pipeline(paper_text: str) -> Dict[str, Any]:
     """Run the full async feedback pipeline for a single paper."""
+    _progress("Generating proposals…")
     proposals = await generate_all_proposals(paper_text)
+
+    _progress("Scoring proposals…")
     scored = await score_all_proposals(paper_text, proposals)
+
+    _progress("Selecting high-quality feedback…")
     selection = select_and_classify(scored)
+
+    _progress("Running critique round…")
+    critiques = await run_critique_round(paper_text, selection.get("high_quality", []))
+    selection["critiques"] = critiques
+
+    _progress("Writing meta-review…")
     meta = await meta_review(selection)
 
     result = {
@@ -558,13 +814,32 @@ __all__ = [
     "meta_review",
     "estimate_pipeline_cost",
 ]
-@@
-    "meta_review",
-]
 
 
-def _read_paper_from_stdin(prompt: bool = False) -> str:
-    if prompt:
+def _read_paper_from_stdin(
+    prompt: bool = False,
+    sentinel: str | None = None,
+) -> str:
+    if prompt and sys.stdin.isatty() and sentinel:
+        print(
+            "Paste paper text below. When you're done, type "
+            f"a line containing only {sentinel!r} and press Enter.\n",
+            file=sys.stderr,
+            end="",
+            flush=True,
+        )
+        lines: List[str] = []
+        while True:
+            try:
+                line = input()
+            except EOFError:
+                break
+            if line.strip() == sentinel:
+                break
+            lines.append(line)
+        return "\n".join(lines)
+
+    if prompt and sys.stdin.isatty():
         print(
             "Paste paper text, then press Ctrl-D (Ctrl-Z then Enter on Windows) when finished:\n",
             file=sys.stderr,
@@ -627,14 +902,19 @@ def main(argv: List[str] | None = None) -> int:
     if args.file and args.paste:
         parser.error("--paste cannot be used together with --file")
 
+    sentinel = "::END::" if (args.paste or sys.stdin.isatty()) else None
+
     if args.file:
         paper_text = _read_paper_from_file(args.file)
     else:
         prompt_for_paste = args.paste or sys.stdin.isatty()
-        paper_text = _read_paper_from_stdin(prompt_for_paste)
+        paper_text = _read_paper_from_stdin(prompt_for_paste, sentinel=sentinel)
 
     if not paper_text.strip():
-        print("No paper text provided (file was empty or stdin had no content).", file=sys.stderr)
+        print(
+            "No paper text provided (file was empty or stdin had no content).",
+            file=sys.stderr,
+        )
         return 1
 
     result = asyncio.run(full_feedback_pipeline(paper_text))
