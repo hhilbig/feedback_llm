@@ -4,7 +4,7 @@ A minimal, async feedback pipeline for quantitative social science papers.
 
 ## How it works
 
-**Generation**: 8 specialized AI workers (theorists, rival researchers, methodologists, editors) review the text and propose high-impact feedback.
+**Generation**: Scalable teams of specialized AI workers (theorists, rival researchers, methodologists, editors) review the text and propose high-impact feedback. The system uses a balanced ratio of personas (e.g., 3 theorists for every 1 editor) regardless of team size.
 
 **Scoring & Critique**: Proposals are scored for importance and actionability, then scrutinized by a "discussant" layer.
 
@@ -42,17 +42,37 @@ python -m feedback_pipeline
 
 The tool will find `paper.txt`, generate feedback, and print the meta-review to your screen.
 
-## Advanced / CLI Usage
+## Advanced Usage & Customization
 
-If you prefer not to use `paper.txt`, you can use flags:
+You can customize the pipeline scale, model power, and synthesis depth using CLI flags.
+
+> **⚠️ Cost Warning**: Using many agents (e.g., 32+) can be very costly, especially with premium models like `gpt-5.2`. Each agent makes API calls, so costs scale linearly with the number of agents. Use `--estimate-cost` to preview costs before running, or start with fewer agents (8-16) and cheaper models (`gpt-5-mini`) to test.
+
+### Customizing Scale & Models
 
 ```bash
-# Run on a specific file
-python -m feedback_pipeline --file drafts/my_paper.txt
+# Power Run: Use 32 agents and the stronger GPT-5.2 model
+python -m feedback_pipeline --agents 32 --model gpt-5.2 --file paper.txt
 
-# Interactive Paste (paste text directly into terminal)
-python -m feedback_pipeline --paste
+# Budget Run: Use 8 agents (default) and the cheaper GPT-5-mini
+python -m feedback_pipeline --model gpt-5-mini --file paper.txt
+```
 
-# Estimate cost (add this flag to any command)
-python -m feedback_pipeline --estimate-cost
+### All Available Flags
+
+| Flag | Description | Default | Notes |
+| --- | --- | --- | --- |
+| `--file` | Path to input text file. | `paper.txt` |  |
+| `--paste` | Paste text directly into terminal. |  | Cannot use with `--file`. |
+| `--agents` | Number of generation workers. | `8` | **Must be a multiple of 8** (e.g., 16, 24, 32). |
+| `--model` | OpenAI model to use. | `gpt-5` | Allowed: `gpt-5.2`, `gpt-5.1`, `gpt-5`, `gpt-5-mini`, `gpt-5-nano`. |
+| `--top-k` | Number of proposals to synthesize. | `5` | Increase this if using high agent counts (e.g., 10 for 32 agents). |
+| `--estimate-cost` | Print token cost after running. |  |  |
+
+### Example: The "Deep Review"
+
+For a major submission, run a large-scale critique and synthesize the top 10 insights:
+
+```bash
+python -m feedback_pipeline --file paper.txt --agents 32 --model gpt-5.2 --top-k 10 --estimate-cost
 ```
