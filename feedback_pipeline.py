@@ -15,7 +15,10 @@ load_dotenv()
 if not os.getenv("OPENAI_API_KEY"):
     print("❌ Error: OPENAI_API_KEY is missing.", file=sys.stderr)
     print("   Please either:", file=sys.stderr)
-    print("   1. Create a file named '.env' containing: OPENAI_API_KEY=sk-...", file=sys.stderr)
+    print(
+        "   1. Create a file named '.env' containing: OPENAI_API_KEY=sk-...",
+        file=sys.stderr,
+    )
     print("   2. Or export it in your terminal.", file=sys.stderr)
     sys.exit(1)
 # ----------------------------------
@@ -43,35 +46,37 @@ SCORING_MODEL = "gpt-5"
 META_MODEL = "gpt-5.1"
 
 MODEL_PRICING = {
-    # Prices in USD per token (converted from USD per million tokens)
-    # Values pulled from OpenAI pricing page (Nov 2025).
+    "gpt-5.2": {
+        "input": 1.75 / 1e6,
+        "output": 14.00 / 1e6,
+        "cached_input": 0.175 / 1e6,
+    },
     "gpt-5.1": {
-        "input": 1.25 / 1_000_000,
-        "output": 10.0 / 1_000_000,
-        "cached_input": 0.125 / 1_000_000,
+        "input": 1.25 / 1e6,
+        "output": 10.00 / 1e6,
+        "cached_input": 0.125 / 1e6,
     },
-    "gpt-5": {
-        "input": 1.00 / 1_000_000,
-        "output": 8.00 / 1_000_000,
-        "cached_input": 0.10 / 1_000_000,
-    },
+    "gpt-5": {"input": 1.25 / 1e6, "output": 10.00 / 1e6, "cached_input": 0.125 / 1e6},
     "gpt-5-mini": {
-        "input": 0.25 / 1_000_000,
-        "output": 2.0 / 1_000_000,
-        "cached_input": 0.025 / 1_000_000,
+        "input": 0.25 / 1e6,
+        "output": 2.00 / 1e6,
+        "cached_input": 0.025 / 1e6,
+    },
+    "gpt-5-nano": {
+        "input": 0.05 / 1e6,
+        "output": 0.40 / 1e6,
+        "cached_input": 0.005 / 1e6,
     },
 }
 
 
-def _lookup_pricing_model(model: str) -> Dict[str, float] | None:
-    pricing = MODEL_PRICING.get(model)
-    if pricing:
-        return pricing
-    # Try prefix match to cover snapshot names like "gpt-5.1-2025-11-13"
-    for key, value in MODEL_PRICING.items():
-        if model.startswith(key):
-            return value
-    return None
+def _lookup_pricing_model(model: str) -> Dict[str, float]:
+    # Strict lookup only. No prefix matching.
+    if model not in MODEL_PRICING:
+        raise ValueError(
+            f"Model '{model}' is not allowed. Choose from: {list(MODEL_PRICING.keys())}"
+        )
+    return MODEL_PRICING[model]
 
 
 _ENCODER_CACHE: Dict[str, tiktoken.Encoding] = {}
@@ -256,7 +261,7 @@ META_SYSTEM_PROMPT = (
 )
 
 
-def _meta_messages(selection: Dict[str, Any]) -> List[Dict[str, str]]:
+def _meta_messages(selection: Dict[str, Any], top_k: int) -> List[Dict[str, str]]:
     by_dim_payload = {
         dim: [
             {
@@ -273,7 +278,8 @@ def _meta_messages(selection: Dict[str, Any]) -> List[Dict[str, str]]:
         for dim, plist in selection["by_dimension"].items()
     }
 
-    top_global = selection.get("sorted_by_composite", [])[:TOP_K]
+    # Use dynamic top_k here
+    top_global = selection.get("sorted_by_composite", [])[:top_k]
     top_global_payload = [
         {
             "id": p["id"],
@@ -284,6 +290,7 @@ def _meta_messages(selection: Dict[str, Any]) -> List[Dict[str, str]]:
         for p in top_global
     ]
 
+    # Use dynamic top_k here
     unique_payload = [
         {
             "id": p["id"],
@@ -292,7 +299,7 @@ def _meta_messages(selection: Dict[str, Any]) -> List[Dict[str, str]]:
             "uniqueness": p["uniqueness"],
             "composite": p["composite"],
         }
-        for p in selection.get("sorted_by_uniqueness", [])[:TOP_K]
+        for p in selection.get("sorted_by_uniqueness", [])[:top_k]
     ]
 
     critiques_payload = selection.get("critiques", [])
@@ -372,7 +379,6 @@ client = AsyncOpenAI()  # Requires OPENAI_API_KEY in environment
 # Thresholds for meta-review inclusion (tune as needed)
 IMPORTANCE_THRESHOLD = 3
 COMPOSITE_THRESHOLD = 3.0
-TOP_K = 3
 
 DIMENSIONS = [
     "contribution",
@@ -412,22 +418,34 @@ PERSONA_EDITOR = (
     "'writing_structure' dimension and resist the temptation to critique statistical methods or theoretical framing."
 )
 
-WORKER_ASSIGNMENTS: List[Dict[str, str]] = [
-    {"id": 1, "persona": PERSONA_THEORIST},
-    {"id": 2, "persona": PERSONA_THEORIST},
-    {"id": 3, "persona": PERSONA_THEORIST},
-    {"id": 4, "persona": PERSONA_RIVAL},
-    {"id": 5, "persona": PERSONA_RIVAL},
-    {"id": 6, "persona": PERSONA_METHODOLOGIST},
-    {"id": 7, "persona": PERSONA_METHODOLOGIST},
-    {"id": 8, "persona": PERSONA_EDITOR},
+BASE_PERSONA_DECK = [
+    PERSONA_THEORIST,
+    PERSONA_THEORIST,
+    PERSONA_THEORIST,  # 3 Theorists
+    PERSONA_RIVAL,
+    PERSONA_RIVAL,  # 2 Rivals
+    PERSONA_METHODOLOGIST,
+    PERSONA_METHODOLOGIST,  # 2 Methodologists
+    PERSONA_EDITOR,  # 1 Editor
 ]
 
-PERSONA_LOOKUP = {
-    assignment["id"]: assignment["persona"] for assignment in WORKER_ASSIGNMENTS
-}
 
-N_GENERATION_WORKERS = len(WORKER_ASSIGNMENTS)
+def create_worker_assignments(num_agents: int) -> List[Dict[str, Any]]:
+    # 1. Validation
+    if num_agents <= 0 or num_agents % 8 != 0:
+        raise ValueError(
+            f"Agent count must be a multiple of 8 (8, 16, 24...). Got {num_agents}."
+        )
+
+    # 2. Multiplication
+    num_blocks = num_agents // 8
+    full_deck = BASE_PERSONA_DECK * num_blocks
+
+    # 3. Assignment Construction
+    assignments = []
+    for i, persona in enumerate(full_deck):
+        assignments.append({"id": i + 1, "persona": persona})
+    return assignments
 
 
 # -------------------------------------------------------------------
@@ -468,17 +486,31 @@ async def generate_single_proposal(
 
 async def generate_all_proposals(
     paper_text: str,
+    workers: List[Dict[str, Any]],  # CHANGED: Now accepts specific worker list
+    model: str,  # CHANGED: Now accepts specific model
 ) -> List[Dict[str, Any]]:
-    tasks = [
-        generate_single_proposal(
-            paper_text,
-            worker_id=assignment["id"],
-            persona_prompt=assignment["persona"],
+
+    tasks = []
+    for assignment in workers:
+        messages = _generation_messages(
+            assignment["persona"], paper_text, assignment["id"]
         )
-        for assignment in WORKER_ASSIGNMENTS
-    ]
-    proposals = await asyncio.gather(*tasks)
-    return proposals
+
+        # We call chat_json explicitly with the chosen model
+        task = chat_json(messages, model=model)
+        tasks.append(task)
+
+    # Gather results and re-attach IDs (since order is preserved in gather)
+    raw_results = await asyncio.gather(*tasks)
+
+    formatted_results = []
+    for i, result in enumerate(raw_results):
+        worker = workers[i]
+        result["id"] = worker["id"]
+        result["persona"] = worker["persona"]
+        formatted_results.append(result)
+
+    return formatted_results
 
 
 # -------------------------------------------------------------------
@@ -553,12 +585,12 @@ async def run_critique_round(
     return critiques
 
 
-def select_and_classify(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
+def select_and_classify(scored: List[Dict[str, Any]], top_k: int) -> Dict[str, Any]:
     # Sort by composite, descending
     sorted_by_composite = sorted(scored, key=lambda x: x["composite"], reverse=True)
 
     # Top K by composite
-    top_proposals = sorted_by_composite[:TOP_K]
+    top_proposals = sorted_by_composite[:top_k]
 
     # Low-value proposals
     low_value_ids = [
@@ -605,8 +637,8 @@ def select_and_classify(scored: List[Dict[str, Any]]) -> Dict[str, Any]:
 # -------------------------------------------------------------------
 
 
-async def meta_review(selection: Dict[str, Any]) -> str:
-    messages = _meta_messages(selection)
+async def meta_review(selection: Dict[str, Any], top_k: int) -> str:
+    messages = _meta_messages(selection, top_k)
     resp = await client.chat.completions.create(
         model=META_MODEL,
         messages=messages,
@@ -625,9 +657,7 @@ def _stage_cost_summary(
     model: str,
 ) -> Dict[str, Any]:
     pricing = _lookup_pricing_model(model)
-    cost = None
-    if pricing:
-        cost = prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]
+    cost = prompt_tokens * pricing["input"] + completion_tokens * pricing["output"]
     total_tokens = prompt_tokens + completion_tokens
     return {
         "model": model,
@@ -646,7 +676,7 @@ def _estimate_generation_tokens(
     completion_tokens = 0
     for proposal in proposals:
         worker_id = proposal.get("id", 0)
-        persona_prompt = PERSONA_LOOKUP.get(worker_id, GENERATION_SYSTEM_PROMPT)
+        persona_prompt = proposal.get("persona", GENERATION_SYSTEM_PROMPT)
         messages = _generation_messages(persona_prompt, paper_text, worker_id)
         prompt_tokens += _count_message_tokens(messages, GENERATION_MODEL)
         completion_tokens += _count_text_tokens(
@@ -724,10 +754,11 @@ def _estimate_critique_tokens(
 def _estimate_meta_tokens(
     selection: Dict[str, Any],
     meta_review_text: str,
+    top_k: int,
 ) -> Tuple[int, int]:
     if not selection:
         return 0, _count_text_tokens(meta_review_text, META_MODEL)
-    messages = _meta_messages(selection)
+    messages = _meta_messages(selection, top_k)
     prompt_tokens = _count_message_tokens(messages, META_MODEL)
     completion_tokens = _count_text_tokens(meta_review_text, META_MODEL)
     return prompt_tokens, completion_tokens
@@ -736,6 +767,8 @@ def _estimate_meta_tokens(
 def estimate_pipeline_cost(
     paper_text: str,
     pipeline_output: Dict[str, Any],
+    gen_model: str,  # New Argument
+    top_k: int = 5,  # For cost estimation
 ) -> Dict[str, Any]:
     proposals = pipeline_output.get("proposals", [])
     scored = pipeline_output.get("scored", [])
@@ -750,15 +783,17 @@ def estimate_pipeline_cost(
         selection.get("high_quality", []),
         critiques,
     )
-    meta_prompt, meta_completion = _estimate_meta_tokens(selection, meta_review_text)
+    meta_prompt, meta_completion = _estimate_meta_tokens(
+        selection, meta_review_text, top_k
+    )
 
     stages = {
-        "generation": _stage_cost_summary(gen_prompt, gen_completion, GENERATION_MODEL),
+        "generation": _stage_cost_summary(gen_prompt, gen_completion, gen_model),
         "scoring": _stage_cost_summary(score_prompt, score_completion, SCORING_MODEL),
         "critiques": _stage_cost_summary(
             critique_prompt,
             critique_completion,
-            GENERATION_MODEL,
+            gen_model,
         ),
         "meta_review": _stage_cost_summary(meta_prompt, meta_completion, META_MODEL),
     }
@@ -783,23 +818,34 @@ def estimate_pipeline_cost(
 # -------------------------------------------------------------------
 
 
-async def full_feedback_pipeline(paper_text: str) -> Dict[str, Any]:
+async def full_feedback_pipeline(
+    paper_text: str,
+    num_agents: int = 8,
+    gen_model: str = "gpt-5",
+    top_k: int = 5,  # New default
+) -> Dict[str, Any]:
     """Run the full async feedback pipeline for a single paper."""
-    _progress("Generating proposals…")
-    proposals = await generate_all_proposals(paper_text)
+
+    # 1. Create workers dynamically
+    workers = create_worker_assignments(num_agents)
+
+    _progress(f"Generating proposals with {num_agents} agents using {gen_model}…")
+    proposals = await generate_all_proposals(paper_text, workers, gen_model)
 
     _progress("Scoring proposals…")
     scored = await score_all_proposals(paper_text, proposals)
 
-    _progress("Selecting high-quality feedback…")
-    selection = select_and_classify(scored)
+    _progress(f"Selecting Top-{top_k} feedback…")
+    # Pass top_k here
+    selection = select_and_classify(scored, top_k)
 
     _progress("Running critique round…")
     critiques = await run_critique_round(paper_text, selection.get("high_quality", []))
     selection["critiques"] = critiques
 
     _progress("Writing meta-review…")
-    meta = await meta_review(selection)
+    # Pass top_k here
+    meta = await meta_review(selection, top_k)
 
     result = {
         "proposals": proposals,
@@ -807,7 +853,10 @@ async def full_feedback_pipeline(paper_text: str) -> Dict[str, Any]:
         "selection": selection,
         "meta_review": meta,
     }
-    result["cost_estimate"] = estimate_pipeline_cost(paper_text, result)
+    # Pass gen_model and top_k here for accurate pricing
+    result["cost_estimate"] = estimate_pipeline_cost(
+        paper_text, result, gen_model, top_k
+    )
     return result
 
 
@@ -913,6 +962,18 @@ def main(argv: List[str] | None = None) -> int:
         action="store_true",
         help="Prompt for interactive paste (forces paste mode).",
     )
+    parser.add_argument(
+        "--agents", type=int, default=8, help="Number of agents (must be multiple of 8)"
+    )
+    parser.add_argument(
+        "--model", type=str, default="gpt-5", choices=list(MODEL_PRICING.keys())
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Number of top proposals to include in meta-review",
+    )
     args = parser.parse_args(argv)
 
     if args.file and args.paste:
@@ -953,7 +1014,19 @@ def main(argv: List[str] | None = None) -> int:
         )
         return 1
 
-    result = asyncio.run(full_feedback_pipeline(paper_text))
+    try:
+        result = asyncio.run(
+            full_feedback_pipeline(
+                paper_text,
+                num_agents=args.agents,
+                gen_model=args.model,
+                top_k=args.top_k,
+            )
+        )
+    except ValueError as e:
+        print(f"Configuration Error: {e}", file=sys.stderr)
+        return 1
+
     print(result["meta_review"])
 
     if args.estimate_cost:
