@@ -1,14 +1,14 @@
-# feedback_llm
+# feedback_pipeline
 
 A minimal, async feedback pipeline for quantitative social science papers.
 
 ## How it works
 
-**Generation**: Scalable teams of specialized AI workers (theorists, rival researchers, methodologists, editors) review the text and propose high-impact feedback. The system uses a balanced ratio of personas (e.g., 3 theorists for every 1 editor) regardless of team size.
+**Generation**: Specialized agents (Theorists, Methodologists, Rival Researchers, Editors) review the text and propose high-impact feedback. Agents are organized in blocks of 8 (3 Theorists, 2 Rivals, 2 Methodologists, 1 Editor) to maintain balanced perspectives as you scale.
 
-**Scoring**: Each proposal is scored twice under different prompt/order variants (rubric order and context order perturbations), then averaged to reduce judge bias.
+**Scoring**: Each proposal is scored twice—once with the manuscript first, and once with the proposal first—then averaged to remove positional bias.
 
-**Critique & Revision**: Top proposals receive critiques from a "discussant" layer, which then revises the proposals. Revised proposals are re-scored and used for final selection.
+**Critique & Revision**: Top proposals receive critiques from a Discussant Agent, which then revises the proposals. Revised proposals are re-scored and merged with the best un-revised proposals for final selection.
 
 **Synthesis**: The highest-quality feedback is synthesized into a structured meta-review containing an **Executive Summary** (prioritized headlines) and a **Technical Implementation Plan** (diagnostic steps).
 
