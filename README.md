@@ -10,7 +10,7 @@ A minimal, async feedback pipeline for quantitative social science papers.
 
 **Critique & Revision**: Top proposals receive critiques from a "discussant" layer, which then revises the proposals. Revised proposals are re-scored and used for final selection.
 
-**Synthesis**: The highest-quality feedback is synthesized into a concise meta-review.
+**Synthesis**: The highest-quality feedback is synthesized into a structured meta-review containing an **Executive Summary** (prioritized headlines) and a **Technical Implementation Plan** (diagnostic steps).
 
 ## Quick Start
 
