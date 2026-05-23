@@ -12,10 +12,10 @@ venv/
 
 # User input files
 paper.txt
+reports/
 
 # macOS metadata
 .DS_Store
 
 # Feedback history (stored in home directory, but ignore if copied here)
 .feedback_llm/
-

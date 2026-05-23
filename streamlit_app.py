@@ -55,6 +55,7 @@ def add_history_entry(paper_text: str, result: dict, model: str, num_agents: int
         "model": model,
         "num_agents": num_agents,
         "meta_review": result["meta_review"],
+        "report_markdown": result.get("report_markdown") or result["meta_review"],
         "actual_usage": result.get("actual_usage"),
     }
     history = load_history()
@@ -196,15 +197,16 @@ if "selected_history_id" not in st.session_state:
 st.title("📝 Paper Feedback Pipeline")
 st.markdown("""
 A single AI response is often hit-or-miss. This tool uses multiple specialized reviewers
-(Theorists, Methodologists, Rivals) to catch different types of errors—from logical gaps to
-statistical flaws. Their feedback is scored, critiqued, and refined before being synthesized
-into a final report.
+(Theorists, Methodologists, Rivals, and a design-specific reviewer) to surface different
+failure modes. Feedback is tied to evidence IDs, verified against the manuscript, routed
+through cheaper models where possible, and synthesized into a final report.
 """)
 
 # --- How it Works ---
 with st.expander("How it works"):
     st.markdown("""
-This pipeline mimics a rigorous academic review process using specialized AI agents.
+This pipeline is evidence-first: it builds a manuscript map, generates diverse critiques,
+verifies each critique against cited evidence, and only then synthesizes the final report.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -213,58 +215,60 @@ This pipeline mimics a rigorous academic review process using specialized AI age
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  1. GENERATION (with Diversity Seeds)                                │
-│     8 specialized agents review your paper in parallel:             │
-│     • 3 Theorists (assumptions / causal mechanisms / frameworks)    │
-│     • 2 Rivals (confounders / competing mechanisms)                 │
-│     • 2 Methodologists (identification / measurement)               │
-│     • 1 Editor (clarity, structure, organization)                   │
-│     Each agent has a unique perspective seed for diverse feedback.  │
+│  1. EVIDENCE MAP                                                    │
+│     Builds stable evidence IDs for sections, paragraphs, tables,    │
+│     figures, equations, and appendices. Suspicious instruction-like │
+│     manuscript text is quarantined before review.                   │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  1b. GROUNDING CHECK                                                │
+│  2. GENERATION (with Diversity Seeds)                               │
+│     8 specialized agents review evidence-indexed context:           │
+│     • 2 Theorists (assumptions / causal mechanisms / frameworks)    │
+│     • 2 Rivals (confounders / competing mechanisms)                 │
+│     • 2 Methodologists (identification / measurement)               │
+│     • 1 Design specialist (DiD / IV / RD / survey / etc.)           │
+│     • 1 Editor (clarity, structure, organization)                   │
+│     Each proposal must cite evidence IDs or mark itself inferential.│
+└─────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│  3. GROUNDING CHECK                                                 │
 │     Flags proposals that reference tables, figures, or sections     │
 │     not found in the paper (hallucination guardrail).               │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  2. SCORING (Dual-Pass + Confidence Weighting)                      │
-│     Each proposal is scored twice to remove positional bias:        │
-│     • Pass 1: Paper shown first, then proposal                      │
-│     • Pass 2: Proposal shown first, then paper                      │
-│     Scores averaged across: Importance, Specificity,                │
-│     Actionability, Uniqueness → Composite score                     │
-│     Composite adjusted ±10% based on judge agreement.               │
+│  4. DOMAIN SCORING + ROUTING                                        │
+│     Cheap models score identification, measurement/sample,          │
+│     interpretation, theory/contribution, evidence support,          │
+│     actionability, and severity. Severe or ambiguous cases escalate.│
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  3. CRITIQUE & REVISION                                             │
-│     Top proposals (composite ≥ 3.0) enter a "Discussant" loop:      │
-│     • Semantic deduplication via embeddings (cosine similarity)     │
-│     • A Discussant Agent critiques each proposal                    │
-│     • Original agents revise based on critique                      │
-│     • Revised proposals are re-scored and merged with originals     │
+│  5. VERIFICATION-FIRST ADJUDICATION                                 │
+│     A verifier decides whether each critique is supported,          │
+│     inferential, demoted, or removed. Rewrite is clarity-only and   │
+│     cannot add new factual claims or evidence IDs.                  │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  4. CLUSTER & SYNTHESIZE                                            │
-│     Related proposals are clustered by embedding similarity.        │
-│     Multi-proposal clusters are synthesized into consolidated       │
-│     findings, preserving the strongest elements from each.          │
+│  6. DEDUP + PRESENTATION CLUSTERS                                   │
+│     Evidence-aware deduplication protects severe minority issues.   │
+│     Clustering only labels related comments for presentation.       │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  5. SYNTHESIS                                                       │
-│     A Meta-Reviewer synthesizes clustered proposals into:           │
-│     • Prioritized list of key revisions                             │
-│     • Section-by-section guidance (contribution, logic,             │
-│       interpretation, writing)                                      │
+│  7. SYNTHESIS                                                       │
+│     A Meta-Reviewer writes evidence-linked guidance on design,      │
+│     measurement/sample, interpretation, theory/contribution, and    │
+│     writing when writing is a binding issue.                        │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
@@ -274,24 +278,29 @@ This pipeline mimics a rigorous academic review process using specialized AI age
 ```
 
 **Why this approach?**
-- **Diverse ensemble**: Each agent gets a unique perspective seed, not just temperature-based stochasticity
-- **Hallucination guardrail**: Catches fabricated references before scoring
-- **Confidence-weighted scoring**: Judge agreement adjusts composite scores ±10%
-- **Semantic deduplication**: Embedding-based similarity catches paraphrased duplicates
-- **Cluster-then-synthesize**: Groups related feedback before meta-review for better synthesis
-- **Dual-pass scoring**: Removes AI's tendency to prefer text shown first
-- **Critique loop**: Refines proposals like human peer review
+- **Evidence map**: Creates auditable manuscript IDs before critique generation
+- **Design-aware ensemble**: Adds a design-specific reviewer for DiD, IV, RD, surveys, and related designs
+- **Domain scoring**: Prioritizes validity, measurement/sample risk, interpretation, evidence support, and actionability
+- **Model routing**: Uses cheaper current models for routine stages and escalates hard cases
+- **Verification first**: Checks support and severity before any rewrite
+- **Protected minority critiques**: Keeps severe evidence-distinct issues from being collapsed away
 """)
 
 # --- Sidebar: Settings ---
 with st.sidebar:
     st.header("Settings")
 
+    from feedback_pipeline import GENERATION_MODEL, current_model_options
+
+    model_options = current_model_options()
     model = st.selectbox(
         "Model",
-        options=["gpt-5", "gpt-5.1", "gpt-5.2", "gpt-5-mini", "gpt-5-nano"],
-        index=0,
-        help="Stronger models cost more but may give better feedback.",
+        options=model_options,
+        index=model_options.index(GENERATION_MODEL),
+        help=(
+            "Generation model. Other stages are routed automatically: "
+            "cheap models for routine scoring/formatting and frontier models for synthesis."
+        ),
     )
 
     agents = st.select_slider(
@@ -468,6 +477,7 @@ if st.session_state.selected_history_id:
         if entry["id"] == st.session_state.selected_history_id:
             display_result = {
                 "meta_review": entry["meta_review"],
+                "report_markdown": entry.get("report_markdown") or entry["meta_review"],
                 "actual_usage": entry.get("actual_usage") or entry.get("cost_estimate"),
             }
             hist_title = entry.get("title", "")
@@ -499,11 +509,11 @@ if display_result:
         )
 
     # Export options
-    meta_review_text = display_result["meta_review"]
+    meta_review_text = display_result.get("report_markdown") or display_result["meta_review"]
     col1, col2 = st.columns(2)
     with col1:
         st.download_button(
-            label="Download as Markdown",
+            label="Download Full Markdown",
             data=meta_review_text,
             file_name="feedback.md",
             mime="text/markdown",

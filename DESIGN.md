@@ -1,103 +1,300 @@
 ## Design Overview
 
-This pipeline runs a rigorous, multi-step review process similar to a high-quality academic workshop.
+This document describes the current implementation in `feedback_pipeline.py` and
+`streamlit_app.py`. The system is an evidence-first, cost-routed feedback pipeline
+for quantitative social science manuscripts.
 
 ### Pipeline Flow
 
+```text
+Paper text
+  |
+  |-- Evidence map
+  |     Strip hidden/control characters
+  |     Quarantine instruction-like manuscript text
+  |     Index sections, paragraphs, tables, figures, equations, appendices
+  |     Extract research question, design, sample, measures, claims, results
+  |
+  |-- Design-aware generation
+  |     8 specialized agents produce evidence-linked proposals
+  |     Agent block: 2 theorists, 2 rivals, 2 methodologists,
+  |     1 design specialist, 1 editor
+  |
+  |-- Grounding check
+  |     Regex guardrail flags missing table, figure, section, appendix,
+  |     column, panel, and equation references
+  |
+  |-- Domain scoring and escalation
+  |     Cheap judge scores validity-relevant dimensions twice
+  |     Severe, ambiguous, low-confidence, or low-agreement items escalate
+  |
+  |-- Selection and evidence-aware deduplication
+  |     Keep high-quality proposals by domain composite
+  |     Protect severe evidence-distinct minority critiques
+  |
+  |-- Verification-first adjudication
+  |     Verifier checks support, severity, evidence IDs, counter-evidence,
+  |     and actionability, then keeps, demotes, or removes proposals
+  |
+  |-- Constrained rewrite and presentation clustering
+  |     Rewrite is clarity-only and cannot add factual claims or evidence IDs
+  |     Clustering labels related proposals only; it does not merge/drop them
+  |
+  |-- Meta-review
+        Final evidence-linked markdown report with prioritized revisions
 ```
-Paper Text
-    │
-    ├─→ Generation Stage (with Perspective Seeds)
-    │    └─→ Specialized Agents with unique focus areas
-    │        (Theorists × 3, Methodologists × 2,
-    │         Rival Researchers × 2, Editor × 1)
-    │
-    ├─→ Grounding Check
-    │    └─→ Flag proposals referencing tables/figures/sections
-    │        not found in the paper (hallucination guardrail)
-    │
-    ├─→ Scoring Stage (Dual-Pass + Confidence Weighting)
-    │    ├─→ Score with manuscript first
-    │    ├─→ Score with proposal first
-    │    ├─→ Average scores to remove bias
-    │    └─→ Adjust composite ±10% by judge agreement
-    │
-    ├─→ Selection Stage
-    │    ├─→ Filter by quality thresholds
-    │    └─→ Semantic deduplication (embedding cosine similarity)
-    │
-    ├─→ Critique & Revision Stage
-    │    ├─→ Discussant Agent critiques top proposals
-    │    └─→ Original Agents rewrite proposals → Revised Output
-    │
-    ├─→ Re-scoring & Merging
-    │    └─→ Merge best Revised & Un-revised items
-    │
-    ├─→ Cluster & Synthesize
-    │    └─→ Group related proposals by embedding similarity
-    │        → Synthesize multi-proposal clusters
-    │
-    └─→ Synthesis Stage
-         └─→ Meta-Reviewer → Final Report
-             ├─→ Executive Summary
-             └─→ Technical Implementation Plan
+
+### Entry Points
+
+**Streamlit app:** `streamlit_app.py`
+
+- Requires `OPENAI_API_KEY` from `.env` or the environment.
+- Accepts pasted text or uploaded PDFs.
+- Lets the user choose generation model, number of agents, and `top_k`.
+- Shows a pre-run cost estimate.
+- Displays progress across the pipeline stages.
+- Saves recent runs to `~/.feedback_llm/history.json`, keeping the most recent 50 entries.
+- Lets the user download the final report as markdown or copy it from the browser.
+
+**CLI:** `python -m feedback_pipeline`
+
+- Input sources are mutually exclusive: `--file`, `--paste`, `--clipboard`, or `--pdf`.
+- If no input flag is passed, the CLI reads piped stdin, then `paper.txt` if present,
+  then falls back to interactive paste.
+- `--agents` must be a multiple of 8.
+- `--model` must be one of the allowed model keys in `MODEL_REGISTRY`.
+- `--top-k` controls how many top proposals are emphasized in the meta-review.
+- Actual token usage and cost are printed unless `--no-cost-estimate` is passed.
+
+### Models and Routing
+
+The model registry is defined in `MODEL_REGISTRY`. Defaults are:
+
+- Generation: `gpt-5.4-mini`
+- Scoring: `gpt-5.4-mini`
+- Verification: `gpt-5.4-mini`
+- Rewrite and simple labels: `gpt-5.4-nano`
+- Meta-review: `gpt-5.5`
+- Escalation: `gpt-5.5`
+
+Previous GPT-5 family models remain allowed for reproducibility. The registry includes
+pricing so estimates and actual usage can be reconciled by stage.
+
+### Evidence Map
+
+The ingestion layer builds deterministic manuscript evidence IDs before any critique
+generation:
+
+- `SEC###` for sections
+- `P###` for paragraphs
+- `TBL###` for tables
+- `FIG###` for figures
+- `EQ###` for equations
+- `APP###` for appendices
+- `Q###` for quarantined instruction-like lines
+
+`sanitize_manuscript_text()` removes zero-width/control characters and quarantines
+prompt-injection-like text. `build_deterministic_evidence_index()` creates auditable
+IDs. `extract_manuscript_evidence_map()` then uses strict structured output to extract:
+
+- research question
+- research design
+- estimand
+- sample
+- measures
+- main claims
+- identification assumptions
+- main results
+- robustness checks
+- tables, figures, appendices
+- limitations
+
+The extracted map is used by generation, verification, and meta-review.
+
+### Generation
+
+Agents are created in blocks of 8:
+
+- 2 Theorists: contribution, logic, assumptions, mechanisms, and theoretical framing.
+- 2 Rival researchers: alternative explanations, rival mechanisms, omitted variables,
+  contextual factors, and selection effects.
+- 2 Methodologists: identification clarity, measurement, sample construction, data limits,
+  and statistical interpretation.
+- 1 Design specialist: method-specific threats for DiD, IV, RD, experiments, surveys,
+  descriptive work, panel observational designs, qualitative work, and mixed methods.
+- 1 Editor: clarity, organization, and structure.
+
+Generation uses `FEEDBACK_PROPOSAL_SCHEMA`. Each proposal includes:
+
+- `id`
+- `dimension`
+- `issue_family`
+- `affected_claim_ids`
+- `evidence_ids`
+- `support_status`
+- `severity`
+- `confidence`
+- `text`
+- `diagnostic_next_steps`
+
+Generation runs in parallel. If some workers fail, the pipeline keeps successful
+proposals; if all fail, it aborts.
+
+### Grounding Check
+
+Generated proposals are annotated before scoring. The guardrail extracts references
+such as `Table 1`, `Figure 2`, `Section 4.1`, `Appendix A`, `Column 2`, `Panel B`,
+and `Equation 1`, then checks whether those strings appear in normalized manuscript
+text.
+
+Grounding failures add:
+
+- `grounding_flag = True`
+- `missing_refs = [...]`
+
+Flagged proposals remain available, but verifier and meta-review prompts treat
+unsupported specifics skeptically.
+
+### Scoring and Escalation
+
+The scorer uses `SCORING_SCHEMA`, not a generic importance/specificity rubric. It
+scores:
+
+- `identification_risk`
+- `measurement_sample_risk`
+- `interpretation_risk`
+- `theory_contribution_risk`
+- `evidence_support`
+- `actionability`
+- `severity`
+- `confidence`
+
+Each proposal is scored twice with swapped context/rubric order. For compatibility
+with older downstream code, `importance` aliases `severity`, `specificity` aliases
+`evidence_support`, and `uniqueness` is a diversity priority rather than a quality
+component.
+
+The composite is:
+
+```text
+0.35 * severity
++ 0.25 * evidence_support
++ 0.20 * actionability
++ 0.20 * max(domain risk scores)
 ```
 
-### Why this approach?
+It is adjusted by reviewer agreement and scorer confidence. Items escalate to the
+frontier model when they are severe and ambiguous, low-confidence, low-agreement,
+or high-impact with weak evidence support.
 
-**1. Diverse Ensemble Generation** Relying on a single AI response is often hit-or-miss. Instead, we deploy "blocks" of specialized agents (Theorists, Methodologists, Rivals), each with a unique perspective seed that steers them toward different analytical focuses. Research shows structured prompt variation outperforms temperature-based stochasticity for ensemble diversity (Schoenegger et al., 2024; Wang et al., 2022).
+### Selection and Deduplication
 
-**2. Fair Scoring (Bias Calibration)** AI models often prefer text simply because it appears first in the prompt. We fix this "positional bias" by scoring every proposal twice: once with the manuscript first, and once with the proposal first. Averaging these scores gives a much fairer signal of quality (Wang et al., 2024; Shi et al., 2024).
+Selection keeps:
 
-**3. Quality through Iteration (The Critique Loop)** First drafts are rarely perfect. Top proposals enter a "Discussant" loop where they are critiqued for vagueness or missing steps. The agents then rewrite their proposals to address these critiques. This mimics human peer review and significantly improves reasoning quality (Madaan et al., 2023).
+- top proposals by domain composite
+- low-value IDs for diagnostics
+- high-quality proposals by threshold
+- diversity-priority proposals
+- proposals grouped by dimension
 
-**4. Actionable Output** The final step is not just a summary. The Meta-Reviewer converts the raw feedback into a Technical Implementation Plan with specific diagnostic steps (e.g., "Run a placebo test on pre-2020 data"), bridging the gap between identifying a problem and solving it.
+High-quality proposals are semantically deduplicated with `text-embedding-3-small`
+when embeddings are available. If embeddings fail, the code falls back to lexical
+Jaccard similarity.
 
-### Scaling & Selection Details
+Deduplication is evidence-aware. Severe critiques in protected issue families
+(`identification_design`, `measurement_sample`, `results_interpretation`) are
+preserved when they cite different evidence or claims, even if their wording is
+semantically similar to another proposal.
 
-**The "Block of 8" System** To maintain a balanced perspective as you scale, agents are added in blocks of 8. Each block contains:
+### Verification and Rewrite
 
-- 3 Theorists: Focus on contribution and logic.
-- 2 Rivals: Focus on alternative explanations.
-- 2 Methodologists: Focus on empirical design.
-- 1 Editor: Focus on clarity and structure.
+The current pipeline does not use a discussant critique/revision loop. Instead,
+`run_verification_round()` applies `VERIFICATION_SCHEMA` to adjudicate each
+high-quality proposal:
 
-**Scoring & Thresholds** We don't just accept everything. Proposals are ranked by a composite score: `0.35 × Importance + 0.25 × Specificity + 0.20 × Actionability + 0.20 × Uniqueness`
+- `decision`: keep, demote, or remove
+- `support_assessment`: supported, partially supported, inferential, unsupported,
+  or contradicted
+- `verified_severity`
+- `supported_evidence_ids`
+- `missing_or_invalid_evidence_ids`
+- `counter_evidence_ids`
+- actionability and confidence
 
-The composite score is then adjusted ±10% based on judge agreement: high-agreement proposals get a boost, contested proposals get a slight penalty. This confidence-weighted scoring reduces the number of samples needed while maintaining accuracy (CISC, 2025).
+`apply_verification_decisions()` removes contradicted/unsupported proposals, demotes
+weakly supported ones, and preserves verifier metadata. `run_constrained_rewrite_round()`
+then rewrites only for clarity. The rewrite prompt forbids new factual claims, new
+tables, new variables, new results, or new evidence IDs.
 
-Only "High-Quality" proposals (Composite ≥ 3.0) make it to the critique stage. This ensures the final meta-review focuses only on the strongest, most actionable insights.
+### Presentation Clustering
 
-**Grounding Check** After generation but before scoring, proposals are checked for hallucinated references. A regex-based guardrail extracts references to tables, figures, sections, and other specific entities, then verifies they actually appear in the paper text. Flagged proposals are annotated (not removed) so the scorer and meta-reviewer can treat them with appropriate skepticism.
+Clustering is presentation-only. It annotates proposals with:
 
-**Semantic Deduplication** Multiple agents often flag similar issues, even across different roles. We remove near-duplicate proposals using embedding cosine similarity (text-embedding-3-small, threshold ~0.82), which catches paraphrased duplicates that word-overlap methods miss. Deduplication is cross-dimensional, so a methodologist and theorist identifying the same underlying issue will be deduplicated.
+- `cluster_id`
+- `cluster_size`
+- `source_ids`
 
-**Cluster-then-Synthesize** Before meta-review, semantically related proposals are clustered using embedding similarity (threshold ~0.65). Multi-proposal clusters are synthesized into consolidated findings via one LLM call per cluster, preserving the strongest elements from each. This intermediate aggregation step improves final synthesis quality (Li et al., 2025) and reduces cognitive load on the meta-reviewer.
+It does not synthesize, replace, merge, or remove proposals. This prevents rare
+high-severity critiques from being hidden by a broader cluster label.
 
-**Reviewer Agreement Signal** The dual-pass scoring produces not just averaged scores, but also a measure of agreement between passes. This "reviewer agreement" score (0-1) is passed to the meta-reviewer, who prioritizes high-consensus issues and notes uncertainty for contested assessments.
+### Meta-review Output
 
-### Reliability Features
+The meta-review receives:
 
-**Retry with Backoff** All API calls retry up to 3 times with exponential backoff (1s, 2s, 4s) on rate limits, timeouts, and connection errors.
+- high-quality proposals by dimension
+- globally strongest proposals by domain composite
+- diversity-priority proposals
+- verifier adjudications
+- all high-quality proposals with evidence IDs, support status, verification status,
+  risk scores, and cluster metadata
 
-**Partial Failure Recovery** If some proposal generations fail, the pipeline continues with successful results rather than crashing entirely.
+The final report starts with `## Narrative Summary` and covers:
 
-### References
+1. Identification and design
+2. Measurement and sample construction
+3. Empirical interpretation
+4. Theory and contribution
+5. Writing and structure, only if writing is a binding issue
 
-- **Gou, Z., Shao, Z., Gong, Y., et al. (2023).** CRITIC: Large Language Models Can Self-Correct with Tool-Interactive Critiquing. *arXiv:2305.11738*.
+It then writes `## Proposed Revisions`, a prioritized numbered list of 3-5 revisions.
+Each revision is marked `[REQUIRED]` or `[SUGGESTED]`, includes evidence IDs and support
+status, and gives a one-sentence justification.
 
-- **Hossain, E., Sinha, S. K., Bansal, N., et al. (2025).** LLMs as Meta-Reviewers' Assistants: A Case Study. *NAACL 2025*.
+The CLI and app download output append `## Evidence Lookup` after the narrative report.
+This deterministic appendix extracts cited evidence IDs from the final report and prints
+their manuscript type, section, source lines, and excerpt. It does not make another API
+call. Use `--no-evidence-appendix` for narrative-only CLI output.
 
-- **Li, Z., et al. (2025).** Generative Self-Aggregation for LLM Ensembles.
+### Cost Tracking
 
-- **Madaan, A., Tandon, N., Gupta, P., et al. (2023).** Self-Refine: Iterative Refinement with Self-Feedback. *arXiv:2303.17651*.
+`estimate_cost_before_run()` estimates costs from prompt templates, paper length,
+agent count, `top_k`, assumed output lengths, routing defaults, and known model
+prices. During a run, `UsageTracker` records token usage by stage and
+`compute_actual_cost()` computes actual costs, including cached-input pricing when
+reported by the API.
 
-- **Schoenegger, P., et al. (2024).** Wisdom of the Silicon Crowd: LLM Ensemble Prediction Capabilities Rival Human Crowd Accuracy. *Science Advances*.
+Tracked stages include evidence map, generation, scoring, score escalation,
+verification, rewrite, clustering, embeddings, and meta-review.
 
-- **Shi, L., Ma, C., Liang, W., Ma, W., Vosoughi, S. (2024).** Judging the Judges: A Systematic Investigation of Position Bias in Pairwise Comparative Assessments by LLMs. *arXiv:2406.07791*.
+### Reliability and Safety Features
 
-- **Wang, P., Li, L., Chen, L., et al. (2024).** Large Language Models are not Fair Evaluators. *ACL 2024*.
+- The OpenAI client is lazy, so imports and offline tests do not require an API key.
+- System prompts treat manuscript text as untrusted data.
+- Instruction-like manuscript lines are quarantined before review agents see text.
+- Structured stages use strict JSON Schema outputs.
+- Chat calls retry transient rate-limit, connection, and timeout errors.
+- Generation supports partial failure recovery.
+- Embedding failure during deduplication falls back to lexical similarity.
+- Presentation clustering failure does not abort the run.
 
-- **Wang, X., Wei, J., Schuurmans, D., et al. (2022).** Self-Consistency Improves Chain of Thought Reasoning in Language Models. *arXiv:2203.11171*.
+### Tests
 
-**Repo:** [https://github.com/hhilbig/feedback_pipeline](https://github.com/hhilbig/feedback_pipeline)
+The `tests/` directory uses `unittest` and mocked API calls for deterministic coverage.
+Current test modules cover:
+
+- model routing and structured output helpers
+- evidence-map indexing and quarantine
+- evidence-ID-aware generation
+- verification-first adjudication
+- domain scoring, escalation, protected deduplication, and presentation clustering
+- mocked end-to-end pipeline behavior
