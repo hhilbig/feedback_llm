@@ -218,7 +218,9 @@ verifies each critique against cited evidence, and only then synthesizes the fin
 │  1. EVIDENCE MAP                                                    │
 │     Builds stable evidence IDs for sections, paragraphs, tables,    │
 │     figures, equations, and appendices. Suspicious instruction-like │
-│     manuscript text is quarantined before review.                   │
+│     manuscript text is quarantined before review. It also builds a  │
+│     substantive design profile for DD/DDD, inference, survey, and   │
+│     text-as-data omission risks.                                    │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
@@ -265,22 +267,32 @@ verifies each critique against cited evidence, and only then synthesizes the fin
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  7. SYNTHESIS                                                       │
-│     A Meta-Reviewer writes evidence-linked guidance on design,      │
-│     measurement/sample, interpretation, theory/contribution, and    │
-│     writing when writing is a binding issue.                        │
+│  7. EDITORIAL TRIAGE                                                │
+│     Verified issues are classified by decision relevance:           │
+│     rejection reason, major blocker, minor, nice-to-have, or drop.  │
+│     Hard caps keep the main report focused on 1-3 issues.           │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│                       FINAL META-REVIEW                             │
+│  8. EDITORIAL REPORT                                                │
+│     The report opens with an editorial diagnosis, then separates    │
+│     decision-relevant issues from non-blocking improvements.        │
+│     Evidence lookup is included; full audit is optional.            │
+└─────────────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                       FINAL REPORT                                  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 **Why this approach?**
 - **Evidence map**: Creates auditable manuscript IDs before critique generation
+- **Substantive coverage**: Adds deterministic design, inference, and text-as-data omission checks
 - **Design-aware ensemble**: Adds a design-specific reviewer for DiD, IV, RD, surveys, and related designs
 - **Domain scoring**: Prioritizes validity, measurement/sample risk, interpretation, evidence support, and actionability
+- **Editorial triage**: Separates publication-relevant blockers from non-blocking improvements
 - **Model routing**: Uses cheaper current models for routine stages and escalates hard cases
 - **Verification first**: Checks support and severity before any rewrite
 - **Protected minority critiques**: Keeps severe evidence-distinct issues from being collapsed away
@@ -299,7 +311,7 @@ with st.sidebar:
         index=model_options.index(GENERATION_MODEL),
         help=(
             "Generation model. Other stages are routed automatically: "
-            "cheap models for routine scoring/formatting and frontier models for synthesis."
+            "cheap models for routine scoring/formatting and frontier models for triage/reporting."
         ),
     )
 
@@ -315,7 +327,17 @@ with st.sidebar:
         min_value=3,
         max_value=15,
         value=5,
-        help="Number of top proposals to include in the meta-review.",
+        help="Number of top proposals emphasized before editorial triage.",
+    )
+
+    review_mode = st.selectbox(
+        "Review mode",
+        options=["Editorial triage", "Comprehensive audit"],
+        index=0,
+        help=(
+            "Editorial triage shows clear problems with rejection-risk labels. "
+            "Comprehensive audit also appends deterministic coverage and evidence appendices."
+        ),
     )
 
     st.divider()
@@ -442,6 +464,8 @@ if st.button("Generate Feedback", type="primary", disabled=not can_run):
                 num_agents=agents,
                 gen_model=model,
                 top_k=top_k,
+                include_evidence_appendix=(review_mode == "Comprehensive audit"),
+                include_audit_appendix=(review_mode == "Comprehensive audit"),
                 progress_callback=update_progress,
             )
         )
@@ -499,14 +523,7 @@ if display_result:
 
     st.header("3. Results")
     meta_review_md = display_result["meta_review"]
-    parts = meta_review_md.split("## Proposed Revisions", 1)
-    st.markdown(_style_meta_review(parts[0]), unsafe_allow_html=True)
-    if len(parts) > 1:
-        st.divider()
-        st.markdown(
-            _style_meta_review("## Proposed Revisions" + parts[1]),
-            unsafe_allow_html=True,
-        )
+    st.markdown(_style_meta_review(meta_review_md), unsafe_allow_html=True)
 
     # Export options
     meta_review_text = display_result.get("report_markdown") or display_result["meta_review"]

@@ -30,20 +30,21 @@ The first run may take 1-2 minutes while dependencies are checked. Later runs sh
 1. Paste paper text or upload a PDF.
 2. Adjust model, agent count, and top-k settings if needed.
 3. Click "Generate Feedback".
-4. Review the evidence-linked report and its evidence lookup appendix.
+4. Review the editorial diagnosis and evidence-linked report. Use comprehensive audit mode when you want the full deterministic checklist appendix.
 
 ## How It Works
 
-The current pipeline has eight stages:
+The current pipeline has nine stages:
 
-1. **Evidence map**: Strips hidden/control characters, quarantines instruction-like manuscript text, indexes sections, paragraphs, tables, figures, equations, and appendices, and extracts a structured manuscript map.
-2. **Design-aware generation**: Eight agents generate one critique each. The panel includes 2 theorists, 2 rivals, 2 methodologists, 1 design specialist, and 1 editor. The design specialist adapts to DiD, IV, RD, experiments, surveys, descriptive work, panel observational designs, qualitative work, and mixed methods.
+1. **Evidence map and substantive design profile**: Strips hidden/control characters, quarantines instruction-like manuscript text, indexes sections, paragraphs, tables, figures, equations, and appendices, extracts a structured manuscript map, and deterministically flags applicable design risks such as DD/DDD inference, repeated-cross-section composition, and text-as-data validation.
+2. **Design-aware generation**: Eight agents generate one critique each. The panel includes 2 theorists, 2 rivals, 2 methodologists, 1 design specialist, and 1 editor. The design specialist adapts to DiD, IV, RD, experiments, surveys, descriptive work, panel observational designs, qualitative work, and mixed methods; the prompts also receive the substantive checklist findings as omission cues.
 3. **Grounding check**: Regex guardrails flag missing table, figure, section, appendix, column, panel, and equation references.
 4. **Domain scoring with routing**: Cheap models score identification risk, measurement/sample risk, interpretation risk, theory/contribution risk, evidence support, actionability, severity, and confidence. Severe, ambiguous, low-confidence, or low-agreement items escalate to the frontier model.
 5. **Selection and evidence-aware deduplication**: High-quality proposals are deduplicated with embeddings, but severe evidence-distinct identification, measurement/sample, and interpretation critiques are protected.
 6. **Verification-first adjudication**: A verifier decides whether each critique is supported, partially supported, inferential, unsupported, or contradicted, then keeps, demotes, or removes it.
 7. **Constrained rewrite and presentation clustering**: Rewrite is clarity-only and cannot add factual claims or evidence IDs. Clustering only labels related proposals for presentation; it does not merge or remove critiques.
-8. **Meta-review plus evidence lookup**: The final report prioritizes identification/design, measurement/sample construction, empirical interpretation, theory/contribution, and writing only when writing is material. A deterministic appendix lists the manuscript excerpts for cited evidence IDs.
+8. **Editorial triage**: A decision-impact stage builds a clear 5-8 item problem list when enough non-marginal problems are available. Each problem receives both a rejection-risk label (high, conditional, low, none) and a decision-tier label (potential rejection reason, major revision issue, minor revision issue, nice-to-have, drop).
+9. **Editorial report plus appendices**: The final report starts with an editorial summary, then a numbered problem list with rejection-risk labels and notes on non-rejection issues. Detailed evidence lookup and substantive coverage appendices are opt-in.
 
 ## Settings
 
@@ -52,8 +53,9 @@ The current pipeline has eight stages:
 | **Model** | Generation model. Other stages route automatically to cheaper or stronger models. |
 | **Number of Agents** | More agents increase breadth and cost. Must be a multiple of 8. |
 | **Top-K Proposals** | Number of top insights emphasized in the final report. |
+| **Review mode** | Editorial triage shows clear problems with rejection-risk labels. Comprehensive audit also appends deterministic coverage and evidence appendices. |
 
-Default routing uses `gpt-5.4-mini` for generation, scoring, and verification, `gpt-5.4-nano` for constrained rewrites and simple labeling, and `gpt-5.5` for meta-review and escalations.
+Default routing uses `gpt-5.4-mini` for generation, scoring, and verification, `gpt-5.4-nano` for constrained rewrites and simple labeling, and `gpt-5.5` for editorial triage, meta-review, and escalations.
 
 Cost note: each run uses the paid OpenAI API. The app shows an estimate before a run and actual usage afterward.
 
@@ -80,7 +82,8 @@ python -m feedback_pipeline --pdf paper.pdf
 python -m feedback_pipeline --file paper.txt
 
 python -m feedback_pipeline --agents 16 --model gpt-5.4-mini --top-k 10 --file paper.txt
-python -m feedback_pipeline --file paper.txt --no-evidence-appendix
+python -m feedback_pipeline --file paper.txt --include-evidence-appendix
+python -m feedback_pipeline --file paper.txt --include-audit-appendix
 ```
 
 See [DESIGN.md](DESIGN.md) for implementation details.

@@ -14,6 +14,8 @@ Paper text
   |     Quarantine instruction-like manuscript text
   |     Index sections, paragraphs, tables, figures, equations, appendices
   |     Extract research question, design, sample, measures, claims, results
+  |     Build deterministic substantive profile and checklist findings
+  |     for DD/DDD, inference, repeated cross-sections, and text-as-data
   |
   |-- Design-aware generation
   |     8 specialized agents produce evidence-linked proposals
@@ -40,8 +42,12 @@ Paper text
   |     Rewrite is clarity-only and cannot add factual claims or evidence IDs
   |     Clustering labels related proposals only; it does not merge/drop them
   |
-  |-- Meta-review
-        Final evidence-linked markdown report with prioritized revisions
+  |-- Editorial triage
+  |     Classify verified issues by publication-decision relevance
+  |     Enforce caps on rejection reasons, major blockers, and non-blocking items
+  |
+  |-- Editorial report
+        Decision-relevant report plus optional audit and evidence lookup appendices
 ```
 
 ### Entry Points
@@ -51,6 +57,7 @@ Paper text
 - Requires `OPENAI_API_KEY` from `.env` or the environment.
 - Accepts pasted text or uploaded PDFs.
 - Lets the user choose generation model, number of agents, and `top_k`.
+- Lets the user choose editorial triage or comprehensive audit mode.
 - Shows a pre-run cost estimate.
 - Displays progress across the pipeline stages.
 - Saves recent runs to `~/.feedback_llm/history.json`, keeping the most recent 50 entries.
@@ -63,7 +70,9 @@ Paper text
   then falls back to interactive paste.
 - `--agents` must be a multiple of 8.
 - `--model` must be one of the allowed model keys in `MODEL_REGISTRY`.
-- `--top-k` controls how many top proposals are emphasized in the meta-review.
+- `--top-k` controls how many top proposals are emphasized before editorial triage.
+- `--include-evidence-appendix` appends deterministic evidence excerpts for cited IDs.
+- `--include-audit-appendix` appends the full deterministic substantive checklist and evidence lookup.
 - Actual token usage and cost are printed unless `--no-cost-estimate` is passed.
 
 ### Models and Routing
@@ -74,6 +83,7 @@ The model registry is defined in `MODEL_REGISTRY`. Defaults are:
 - Scoring: `gpt-5.4-mini`
 - Verification: `gpt-5.4-mini`
 - Rewrite and simple labels: `gpt-5.4-nano`
+- Editorial triage: `gpt-5.5`
 - Meta-review: `gpt-5.5`
 - Escalation: `gpt-5.5`
 
@@ -109,7 +119,26 @@ IDs. `extract_manuscript_evidence_map()` then uses strict structured output to e
 - tables, figures, appendices
 - limitations
 
-The extracted map is used by generation, verification, and meta-review.
+The extracted map is used by generation, verification, editorial triage, and final reporting.
+
+### Substantive Design Profile
+
+After evidence-map construction, deterministic checkers classify substantive designs,
+data types, and key risks. This stage deliberately ignores spelling, prose polish, and
+LaTeX formatting. It focuses on omission risks that matter for quantitative review:
+
+- DD/DDD and event-study checks for parallel trends, treatment timing, anticipation,
+  inference level, group-time cell sizes, and placebo groups.
+- Survey and repeated-cross-section checks for composition, sampling, weights, and
+  small treated groups.
+- Text-as-data and LLM-coded outcome checks for validation samples, prompt/held-out
+  separation, model-version reproducibility, confusion matrices, prevalence,
+  measurement error, conditional outcomes, and article-level temporal dependence.
+
+The resulting `substantive_profile` and `substantive_checks` are passed to generation,
+verification, and editorial triage as omission cues. They are not treated as proof of a flaw:
+LLM stages must still ground any substantive critique in evidence IDs or clearly mark it
+as inferential.
 
 ### Generation
 
@@ -152,7 +181,7 @@ Grounding failures add:
 - `grounding_flag = True`
 - `missing_refs = [...]`
 
-Flagged proposals remain available, but verifier and meta-review prompts treat
+Flagged proposals remain available, but verifier and final-report prompts treat
 unsupported specifics skeptically.
 
 ### Scoring and Escalation
@@ -237,33 +266,71 @@ Clustering is presentation-only. It annotates proposals with:
 It does not synthesize, replace, merge, or remove proposals. This prevents rare
 high-severity critiques from being hidden by a broader cluster label.
 
-### Meta-review Output
+### Editorial Triage
 
-The meta-review receives:
+Before the final report is written, `editorial_triage()` classifies verified proposals
+and unresolved substantive checklist findings into a clear problem list with separate
+decision-risk labels.
 
-- high-quality proposals by dimension
-- globally strongest proposals by domain composite
-- diversity-priority proposals
-- verifier adjudications
-- all high-quality proposals with evidence IDs, support status, verification status,
-  risk scores, and cluster metadata
+Rejection-risk labels:
 
-The final report starts with `## Narrative Summary` and covers:
+- `high`
+- `conditional`
+- `low`
+- `none`
 
-1. Identification and design
-2. Measurement and sample construction
-3. Empirical interpretation
-4. Theory and contribution
-5. Writing and structure, only if writing is a binding issue
+Decision-tier labels:
 
-It then writes `## Proposed Revisions`, a prioritized numbered list of 3-5 revisions.
-Each revision is marked `[REQUIRED]` or `[SUGGESTED]`, includes evidence IDs and support
-status, and gives a one-sentence justification.
+- `potential_rejection_reason`
+- `major_revision_issue`
+- `minor_revision_issue`
+- `nice_to_have`
+- `drop`
 
-The CLI and app download output append `## Evidence Lookup` after the narrative report.
-This deterministic appendix extracts cited evidence IDs from the final report and prints
-their manuscript type, section, source lines, and excerpt. It does not make another API
-call. Use `--no-evidence-appendix` for narrative-only CLI output.
+This stage asks two separate questions: whether an issue is important enough to appear
+in a serious problem list, and how much rejection risk it carries. The triage schema
+records why the problem matters, what would make it rejection-level, why it is not
+currently rejection-level, the minimum fix, fixability, affected core claim, evidence
+strength, existing mitigations, output location, and recommended action.
+
+Hard post-processing rules enforce editorial discipline:
+
+- at most 2 potential rejection reasons
+- at most 8 clear problems in the main problem list
+- demote verifier-demoted issues by one level
+- demote rejection-level checklist diagnostics unless triage gives a conditional/high
+  rejection-risk rationale
+
+### Editorial Report Output
+
+The final report receives:
+
+- editorial triage classifications
+- issue inputs used for triage
+- verified high-quality proposals as context
+
+The final report starts with `## Editorial Summary` and then writes:
+
+1. `## Clear Problems and Rejection Risk`
+2. `## Notes on Non-Rejection Issues`
+
+The main problem list is capped at 5-8 clear problems when enough non-marginal issues
+are available. It explicitly says whether the extracted evidence shows no clear
+rejection-level flaw, conditional rejection risks, potential rejection reasons, mostly
+major-revision issues, or mostly minor issues. It does not print the full coverage
+audit or evidence lookup by default.
+
+Use `--include-evidence-appendix` to append `## Evidence Lookup` after the narrative
+report. This deterministic appendix extracts cited evidence IDs from the final report
+and prints their manuscript type, section, source lines, and excerpt. It does not make
+another API call.
+
+When `--include-audit-appendix` or comprehensive audit mode is used, the output appends
+both `## Evidence Lookup` and `## Substantive Coverage Audit`. The coverage checklist
+reports the detected design/data profile, unresolved deterministic substantive
+findings, and whether the final report visibly addressed applicable review categories
+such as inference, measurement, sample construction, robustness, interpretation, and
+text-as-data validation.
 
 ### Cost Tracking
 
@@ -274,7 +341,7 @@ prices. During a run, `UsageTracker` records token usage by stage and
 reported by the API.
 
 Tracked stages include evidence map, generation, scoring, score escalation,
-verification, rewrite, clustering, embeddings, and meta-review.
+verification, rewrite, clustering, embeddings, editorial triage, and meta-review.
 
 ### Reliability and Safety Features
 
@@ -297,4 +364,5 @@ Current test modules cover:
 - evidence-ID-aware generation
 - verification-first adjudication
 - domain scoring, escalation, protected deduplication, and presentation clustering
+- editorial triage caps and decision-impact report prompting
 - mocked end-to-end pipeline behavior
