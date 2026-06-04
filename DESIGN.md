@@ -21,6 +21,7 @@ Paper text
   |     8 specialized agents produce evidence-linked proposals
   |     Agent block: 2 theorists, 2 rivals, 2 methodologists,
   |     1 design specialist, 1 editor
+  |     Optional anonymized review-digest memory calibrates tone and reviewer salience
   |
   |-- Grounding check
   |     Regex guardrail flags missing table, figure, section, appendix,
@@ -29,6 +30,8 @@ Paper text
   |-- Domain scoring and escalation
   |     Cheap judge scores validity-relevant dimensions twice
   |     Severe, ambiguous, low-confidence, or low-agreement items escalate
+  |     Optional historical-review calibration adds separate reviewer-likelihood
+  |     and decision-risk scores without replacing scientific-validity scores
   |
   |-- Selection and evidence-aware deduplication
   |     Keep high-quality proposals by domain composite
@@ -74,6 +77,60 @@ Paper text
 - `--include-evidence-appendix` appends deterministic evidence excerpts for cited IDs.
 - `--include-audit-appendix` appends the full deterministic substantive checklist and evidence lookup.
 - Actual token usage and cost are printed unless `--no-cost-estimate` is passed.
+- `--inspect-review-corpus --review-corpus PATH` loads an archived review folder,
+  prints record/issue/paper-match counts, and exits without calling the API.
+- `--include-low-confidence-reviews` includes forwarded/low-confidence records in
+  local corpus inspection only.
+- `--review-corpus PATH` on a normal run enables private historical-review memory
+  for generation and editorial triage.
+- `--eval-review-corpus PATH` builds whole-paper held-out splits from the archive,
+  estimates per-split API cost, and optionally saves a JSON plan without calling
+  the API.
+- `--eval-run-api` actually runs the held-out evaluation. It should be used only
+  after reviewing the dry-run estimate because it calls the paid API.
+
+### Historical Review Corpus
+
+The optional review-corpus layer turns a private archive of past journal decisions
+and matched papers into local calibration data. The current archive files are
+extracted review digests, not certified raw referee-report exports. The layer does
+not train a model and does not expose old reviews in the final report. The current
+implementation:
+
+- Parses archived Markdown review digests and `papers/PAPER_MATCHES.md`.
+- Links each review record to matched paper PDFs when available.
+- Excludes forwarded/low-confidence records by default.
+- Reads optional raw Gmail sidecars from `raw_gmail_exports/*.md`. When a sidecar
+  names a `Review file`, its raw reviewer/editor sections replace the digest
+  sections for that record. Records without sidecars still use digests.
+- Atomizes reviewer/editor sections into raw-or-digest-derived issue candidates with issue
+  type, decision tier, action-request, tone, paper section, reviewer-confidence
+  heuristic, design type, and paper-match metadata.
+- Uses pseudonymous paper IDs and redacts titles, submission IDs, message IDs,
+  emails, URLs, and obvious author identifiers before prompt memory is built.
+- Retrieves similar historical issues with a transparent lexical baseline plus
+  design/type metadata. If no issue clears the similarity threshold, no memory
+  block is sent; there is no generic fallback to unrelated major comments.
+- Builds review-memory prompt context for tone, specificity, and reviewer salience
+  only. Prompts explicitly forbid importing facts from historical reviews.
+- Adds `reviewer_likelihood_score`, `decision_risk_score`, and
+  `similar_issue_ids` to proposals when `--review-corpus` is enabled.
+- Provides local held-out evaluation scaffolding through
+  `compare_generated_to_human_issues()`. Matching now uses a local semantic
+  matcher: weighted issue-concept/token features retrieve the nearest held-out
+  review issue, and a rule-based verifier labels matched, partially matched, or
+  novel/unmatched issues. It is still local and non-API, not a paid LLM verifier.
+- Provides a whole-paper held-out eval harness through
+  `run_historical_review_eval()`. Each split removes every review round for one
+  pseudonymous paper ID from review memory, runs or plans the pipeline on the
+  matched paper, and compares generated issues against the held-out issue
+  candidates. Dry-run mode estimates costs only and makes no API calls. API-mode
+  JSON keeps compact generated-issue summaries so matching logic can be audited
+  later without rerunning the paid pipeline.
+
+The reviewer-likelihood score is intentionally separate from scientific validity.
+A comment can be likely to appear in a referee report without being correct, and a
+valid concern can be absent from the historical corpus.
 
 ### Models and Routing
 

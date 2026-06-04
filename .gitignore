@@ -14,6 +14,13 @@ venv/
 paper.txt
 reports/
 
+# Private review-memory/evaluation artifacts
+journal_reviews_inbox*/
+raw_gmail_exports/
+papers/files/
+feedback_llm_review_eval*.json
+review_eval*.json
+
 # macOS metadata
 .DS_Store
 

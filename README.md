@@ -84,6 +84,26 @@ python -m feedback_pipeline --file paper.txt
 python -m feedback_pipeline --agents 16 --model gpt-5.4-mini --top-k 10 --file paper.txt
 python -m feedback_pipeline --file paper.txt --include-evidence-appendix
 python -m feedback_pipeline --file paper.txt --include-audit-appendix
+
+# Inspect a local archive of historical journal reviews without calling the API.
+python -m feedback_pipeline --inspect-review-corpus --review-corpus /path/to/journal_reviews_inbox_2026-06-04
+
+# Optional raw Gmail sidecars can be stored under:
+# /path/to/journal_reviews_inbox_2026-06-04/raw_gmail_exports/*.md
+# When a sidecar contains "- Review file: `...`", it replaces the digest text for that record.
+
+# Include forwarded/low-confidence archive entries only for local inspection.
+python -m feedback_pipeline --inspect-review-corpus --review-corpus /path/to/journal_reviews_inbox_2026-06-04 --include-low-confidence-reviews
+
+# Use anonymized, digest-derived historical reviewer patterns for tone/salience calibration.
+# The final report does not expose old review examples.
+python -m feedback_pipeline --file paper.txt --review-corpus /path/to/journal_reviews_inbox_2026-06-04
+
+# Build a whole-paper held-out review-eval plan without calling the API.
+python -m feedback_pipeline --eval-review-corpus /path/to/journal_reviews_inbox_2026-06-04 --eval-limit 3 --eval-output outputs/review_eval_plan.json
+
+# Paid API mode for the same held-out eval, after reviewing the dry-run cost.
+python -m feedback_pipeline --eval-review-corpus /path/to/journal_reviews_inbox_2026-06-04 --eval-limit 1 --eval-run-api
 ```
 
 See [DESIGN.md](DESIGN.md) for implementation details.

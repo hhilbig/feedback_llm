@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -6,6 +7,7 @@ import sys
 from argparse import ArgumentParser
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 # --- Smart API Key Loading ---
@@ -149,6 +151,43 @@ class ModelRoutingConfig:
 
 DEFAULT_MODEL_ROUTING = ModelRoutingConfig()
 
+DEFAULT_REVIEW_ARCHIVE_PATH = "/Users/hanno/Desktop/journal_reviews_inbox_2026-06-04"
+LOW_CONFIDENCE_REVIEW_DIRS = {"forwarded_or_low_confidence"}
+RAW_REVIEW_EXPORT_DIR = "raw_gmail_exports"
+REVIEW_MEMORY_MIN_SIMILARITY = 0.06
+REVIEW_MEMORY_SOURCE_KIND = "review_digest"
+RAW_REVIEW_SOURCE_KIND = "raw_gmail_body"
+
+
+@dataclass(frozen=True)
+class ReviewIssue:
+    """Historical reviewer issue candidate used for evaluation and calibration."""
+
+    paper_id: str
+    review_file: str
+    journal: str
+    decision: str
+    review_round: str
+    reviewer_id: str
+    atomic_issue_id: str
+    issue_text: str
+    issue_type: str
+    decision_tier: str
+    action_requested: str
+    tone: str
+    paper_section: str
+    reviewer_confidence: str
+    design_type: str = "unclear"
+    source_kind: str = REVIEW_MEMORY_SOURCE_KIND
+    matched_paper_files: Tuple[str, ...] = ()
+    match_status: str = ""
+    quality_flag: str = "use"
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = self.__dict__.copy()
+        data["matched_paper_files"] = list(self.matched_paper_files)
+        return data
+
 
 def _lookup_pricing_model(model: str) -> Dict[str, float]:
     # Strict lookup only. No prefix matching.
@@ -246,6 +285,1349 @@ def _count_message_tokens(messages: List[Dict[str, str]], model: str) -> int:
 
 def _progress(message: str) -> None:
     print(f"[feedback] {message}", file=sys.stderr)
+
+
+# -------------------------------------------------------------------
+# 0. Historical review corpus: parsing, memory, and eval scaffolding
+# -------------------------------------------------------------------
+
+
+REVIEW_SECTION_RE = re.compile(r"^##\s+(Editor|Reviewer\s+#?\s*\d+|Review\s+#?\s*\d+)\s*$", re.I | re.M)
+MD_TABLE_ROW_RE = re.compile(r"^\|(.+)\|\s*$")
+
+ISSUE_TYPE_KEYWORDS = [
+    ("identification", ["parallel trend", "identification", "causal", "endogeneity", "simultaneity", "design", "estimand", "pre-trend", "pretrend", "selection"]),
+    ("measurement", ["measure", "measurement", "coding", "sample", "missing", "weight", "variable", "operationaliz", "data"]),
+    ("interpretation", ["interpret", "overclaim", "claim", "mechanism", "alternative explanation", "generaliz", "scope", "external validity"]),
+    ("theory", ["theory", "theoretical", "contribution", "literature", "novelty", "framing"]),
+    ("robustness", ["robust", "sensitivity", "placebo", "specification", "diagnostic", "appendix"]),
+    ("presentation", ["terminology", "writing", "clarity", "structure", "contextual", "explain", "discussion"]),
+]
+
+ACTION_KEYWORDS = [
+    "wanted",
+    "asked",
+    "requested",
+    "recommended",
+    "suggested",
+    "encouraged",
+    "called for",
+    "needs",
+    "should",
+]
+
+EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b", re.I)
+URL_RE = re.compile(r"https?://\S+|www\.\S+", re.I)
+LONG_HEX_RE = re.compile(r"\b[a-f0-9]{12,}\b", re.I)
+SUBMISSION_ID_RE = re.compile(
+    r"\b(?:AJPS|APSR|BJPOLS|BJPS|JOP|CPS|JRSSA|PSRM|POP|FENP)"
+    r"(?:[- ]?[A-Z])?(?:[- ]?\d+[A-Z0-9-]*)+\b",
+    re.I,
+)
+REVIEW_ACTION_SENTENCE_RE = re.compile(
+    r"^(?:they|the reviewer|reviewer\s+\d+|the editor|editor)\s+"
+    r"(?:wanted|asked|requested|recommended|suggested|encouraged|called for|noted that|argued that|thought that)\b",
+    re.I,
+)
+
+
+def _slugify_id(text: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+    return slug[:80] or "paper"
+
+
+def _stable_short_hash(text: str, length: int = 12) -> str:
+    normalized = re.sub(r"\s+", " ", text or "").strip().lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:length]
+
+
+def _pseudonymous_paper_id(record: Dict[str, Any]) -> str:
+    basis = record.get("manuscript") or record.get("review_file") or record.get("title") or "paper"
+    return f"paper_{_stable_short_hash(basis)}"
+
+
+def sanitize_historical_review_text(text: str, manuscript_title: str = "") -> str:
+    """Redact old-review identifiers before using examples in model prompts."""
+    safe = text or ""
+    if manuscript_title and len(manuscript_title.split()) >= 2:
+        safe = re.sub(re.escape(manuscript_title), "[past paper title]", safe, flags=re.I)
+    safe = re.sub(r"\bHanno\s+Hilbig\b", "[author]", safe, flags=re.I)
+    safe = re.sub(r"\b(?:Professor|Prof\.?|Dr\.?)\s+Hilbig\b", "[author]", safe, flags=re.I)
+    safe = EMAIL_RE.sub("[email]", safe)
+    safe = URL_RE.sub("[url]", safe)
+    safe = SUBMISSION_ID_RE.sub("[submission id]", safe)
+    safe = LONG_HEX_RE.sub("[message id]", safe)
+    safe = re.sub(r"`[^`]+`", "[redacted]", safe)
+    return re.sub(r"\s+", " ", safe).strip()
+
+
+def _split_markdown_table_row(row: str) -> List[str]:
+    cells = row.strip().strip("|").split("|")
+    return [cell.strip().replace("<br>", "; ") for cell in cells]
+
+
+def _parse_markdown_metadata(text: str) -> Dict[str, str]:
+    metadata: Dict[str, str] = {}
+    for line in text.splitlines():
+        match = re.match(r"^\s*-\s+([^:]+):\s*(.*)\s*$", line)
+        if not match:
+            continue
+        key = match.group(1).strip().lower().replace(" ", "_")
+        value = match.group(2).strip()
+        metadata[key] = value.strip("`")
+    return metadata
+
+
+def parse_review_markdown(path: str | Path, archive_root: str | Path | None = None) -> Dict[str, Any]:
+    """Parse one archived review markdown file into reviewer/editor sections.
+
+    This parser is deliberately conservative. It preserves the extracted digest text
+    and derives only stable metadata from headings and bullet fields.
+    """
+    file_path = Path(path)
+    root = Path(archive_root) if archive_root else file_path.parent
+    text = file_path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    title = ""
+    for line in lines:
+        if line.strip().startswith("# "):
+            title = line.strip("# ").strip()
+            break
+
+    metadata = _parse_markdown_metadata(text)
+    rel_path = str(file_path.relative_to(root)) if file_path.is_relative_to(root) else str(file_path)
+    journal = title.split(" - ", 1)[0].strip() if " - " in title else file_path.parent.name.upper()
+    manuscript = title.split(" - ", 1)[1].strip() if " - " in title else title
+
+    sections: List[Dict[str, str]] = []
+    matches = list(REVIEW_SECTION_RE.finditer(text))
+    for idx, match in enumerate(matches):
+        section_start = match.end()
+        section_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        section_title = match.group(1).strip()
+        section_text = text[section_start:section_end].strip()
+        if section_text:
+            sections.append({"reviewer_id": section_title, "text": section_text})
+
+    return {
+        "review_file": rel_path,
+        "title": title,
+        "journal": journal,
+        "manuscript": manuscript,
+        "date": metadata.get("date", ""),
+        "decision": metadata.get("decision", ""),
+        "source": metadata.get("source", ""),
+        "gmail_id": metadata.get("gmail_message_id", metadata.get("gmail_message_id", "")),
+        "source_kind": REVIEW_MEMORY_SOURCE_KIND,
+        "sections": sections,
+        "raw_text": text,
+    }
+
+
+def load_raw_review_exports(archive_root: str | Path) -> Dict[str, Dict[str, Any]]:
+    """Load optional raw Gmail review sidecars keyed by archive review file."""
+    root = Path(archive_root)
+    raw_dir = root / RAW_REVIEW_EXPORT_DIR
+    if not raw_dir.exists():
+        return {}
+    raw_records: Dict[str, Dict[str, Any]] = {}
+    for raw_path in sorted(raw_dir.glob("*.md")):
+        record = parse_review_markdown(raw_path, archive_root=raw_dir)
+        metadata = _parse_markdown_metadata(record.get("raw_text", ""))
+        review_file = metadata.get("review_file", "").strip("`")
+        if not review_file:
+            continue
+        record["review_file"] = review_file
+        record["raw_export_file"] = str(raw_path.relative_to(root))
+        record["source_kind"] = RAW_REVIEW_SOURCE_KIND
+        record["gmail_id"] = metadata.get("gmail_message_id", record.get("gmail_id", ""))
+        raw_records[review_file] = record
+    return raw_records
+
+
+def parse_paper_matches(path: str | Path, archive_root: str | Path | None = None) -> Dict[str, Dict[str, Any]]:
+    """Parse PAPER_MATCHES.md into a review-file -> matched-paper mapping."""
+    file_path = Path(path)
+    root = Path(archive_root) if archive_root else file_path.parent.parent
+    if not file_path.exists():
+        return {}
+
+    matches: Dict[str, Dict[str, Any]] = {}
+    current_section = ""
+    for line in file_path.read_text(encoding="utf-8").splitlines():
+        if line.startswith("## "):
+            current_section = line.strip("# ").strip()
+            continue
+        if not line.startswith("|") or "---" in line:
+            continue
+        cells = _split_markdown_table_row(line)
+        if current_section.startswith("Main") and len(cells) >= 7 and cells[3] != "Review file":
+            review_file_cell = cells[3]
+            paper_cell = cells[4]
+            status = cells[5]
+            source_notes = cells[6]
+        elif current_section.startswith("Forwarded") and len(cells) >= 7 and cells[3] != "Review file":
+            review_file_cell = cells[3]
+            paper_cell = cells[4]
+            status = cells[5]
+            source_notes = cells[6]
+        else:
+            continue
+
+        review_files = re.findall(r"`([^`]+\.md)`", review_file_cell)
+        paper_files = re.findall(r"`([^`]+\.pdf)`", paper_cell)
+        for review_file in review_files:
+            resolved_papers = []
+            for paper in paper_files:
+                paper_path = Path(paper)
+                if not paper_path.is_absolute():
+                    paper_path = root / paper_path
+                resolved_papers.append(str(paper_path))
+            matches[review_file] = {
+                "matched_paper_files": resolved_papers,
+                "match_status": status,
+                "source_notes": source_notes,
+            }
+    return matches
+
+
+def _sentence_like_units(text: str) -> List[str]:
+    cleaned = re.sub(r"\s+", " ", text.replace("\u2019", "'")).strip()
+    if not cleaned:
+        return []
+    bullet_units = [
+        re.sub(r"^\s*[-*]\s+", "", line).strip()
+        for line in text.splitlines()
+        if re.match(r"^\s*[-*]\s+", line)
+    ]
+    if bullet_units:
+        return [unit for unit in bullet_units if len(unit.split()) >= 5]
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z\"'])", cleaned)
+    return [part.strip() for part in parts if len(part.split()) >= 7]
+
+
+def _issue_candidate_units(text: str) -> List[str]:
+    sentences = _sentence_like_units(text)
+    if not sentences:
+        return []
+    units: List[str] = []
+    for sentence in sentences:
+        if units and REVIEW_ACTION_SENTENCE_RE.search(sentence) and len(units[-1].split()) <= 70:
+            units[-1] = f"{units[-1]} {sentence}"
+        else:
+            units.append(sentence)
+    return units
+
+
+def infer_issue_type(issue_text: str) -> str:
+    lowered = issue_text.lower()
+    for issue_type, keywords in ISSUE_TYPE_KEYWORDS:
+        if any(keyword in lowered for keyword in keywords):
+            return issue_type
+    return "other"
+
+
+def infer_design_type_from_text(text: str) -> str:
+    lowered = text.lower()
+    design_keywords = [
+        ("difference_in_differences", ["difference-in-differences", "difference in differences", "did", "parallel trend", "pre-trend", "pretrend", "event-study", "event study", "treatment leads"]),
+        ("instrumental_variables", ["instrument", "exclusion restriction", "first stage", "2sls", "iv estimate"]),
+        ("regression_discontinuity", ["regression discontinuity", "running variable", "bandwidth", "cutoff", "manipulation test"]),
+        ("experiment", ["experiment", "random assignment", "randomization", "treatment arm", "control arm"]),
+        ("survey", ["survey", "respondent", "question wording", "weights", "sampling frame"]),
+        ("text_as_data", ["text-as-data", "text as data", "llm-coded", "newspaper", "news corpus", "media coverage", "coded articles"]),
+        ("panel_observational", ["panel data", "fixed effects", "unit fixed effects", "two-way fixed effects", "observational panel"]),
+    ]
+    for design_type, keywords in design_keywords:
+        if any(keyword in lowered for keyword in keywords):
+            return design_type
+    return "unclear"
+
+
+def infer_paper_section(issue_text: str) -> str:
+    lowered = issue_text.lower()
+    section_keywords = [
+        ("methods_design", ["identification", "design", "estimator", "parallel trend", "instrument", "randomization", "cutoff"]),
+        ("data_measurement", ["data", "measure", "measurement", "sample", "coding", "variable", "missing", "weight"]),
+        ("results_robustness", ["result", "coefficient", "table", "figure", "robust", "placebo", "sensitivity", "pre-trend"]),
+        ("interpretation", ["interpret", "mechanism", "alternative explanation", "overclaim", "scope", "external validity"]),
+        ("theory_framing", ["theory", "contribution", "literature", "novelty", "framing"]),
+        ("presentation", ["writing", "clarity", "structure", "terminology", "explain"]),
+    ]
+    for section, keywords in section_keywords:
+        if any(keyword in lowered for keyword in keywords):
+            return section
+    return "unspecified"
+
+
+def infer_reviewer_confidence(issue_text: str) -> str:
+    lowered = issue_text.lower()
+    high_terms = ["fatal", "fundamental", "not convinced", "serious", "major", "central", "undermine", "cannot recommend"]
+    low_terms = ["minor", "smaller", "wording", "could", "might", "optional", "nice to have"]
+    if any(term in lowered for term in high_terms):
+        return "high"
+    if any(term in lowered for term in low_terms):
+        return "low"
+    return "medium"
+
+
+def infer_decision_tier(issue_text: str, decision: str = "", reviewer_id: str = "") -> str:
+    lowered = " ".join([issue_text, decision, reviewer_id]).lower()
+    if any(term in lowered for term in ["fatal", "reject", "not ready", "cannot recommend", "fundamental"]):
+        return "potential_rejection_reason"
+    if any(term in lowered for term in ["major", "main concern", "central", "serious", "not convinced", "overclaim"]):
+        return "major_revision_issue"
+    if any(term in lowered for term in ["minor", "smaller", "terminology", "clarity", "wording"]):
+        return "minor_revision_issue"
+    if "editor" in reviewer_id.lower() and any(term in decision.lower() for term in ["revise", "reject"]):
+        return "major_revision_issue"
+    return "major_revision_issue" if any(term in decision.lower() for term in ["reject", "revise"]) else "minor_revision_issue"
+
+
+def infer_action_requested(issue_text: str) -> str:
+    sentences = _sentence_like_units(issue_text)
+    for sentence in sentences or [issue_text]:
+        lowered = sentence.lower()
+        if any(keyword in lowered for keyword in ACTION_KEYWORDS):
+            return sentence.strip()
+    return ""
+
+
+def infer_tone(issue_text: str) -> str:
+    lowered = issue_text.lower()
+    if any(term in lowered for term in ["not convinced", "concern", "worried", "skeptical", "unclear"]):
+        return "skeptical"
+    if any(term in lowered for term in ["liked", "strong", "rigorous", "valuable", "promising"]):
+        return "constructive"
+    return "neutral"
+
+
+def atomize_review_record(record: Dict[str, Any], match_info: Dict[str, Any] | None = None) -> List[ReviewIssue]:
+    """Split one parsed review digest into issue candidates.
+
+    The current archive contains extracted review digests, not verified raw
+    referee reports. These units are therefore useful for calibration and
+    regression tests, but should not be treated as verbatim historical reviews.
+    """
+    issues: List[ReviewIssue] = []
+    paper_id = _pseudonymous_paper_id(record)
+    match_info = match_info or {}
+    matched_files = tuple(match_info.get("matched_paper_files", []))
+    match_status = match_info.get("match_status", "")
+    manuscript = record.get("manuscript", "")
+    record_design = infer_design_type_from_text(" ".join([manuscript, record.get("raw_text", "")]))
+    round_label = ""
+    review_file = record.get("review_file", "")
+    round_match = re.search(r"(R\d+|round[_-]?\d+|RR|accept|reject)", review_file, re.I)
+    if round_match:
+        round_label = round_match.group(1)
+
+    for section in record.get("sections", []):
+        reviewer_id = section.get("reviewer_id", "Reviewer")
+        units = _issue_candidate_units(section.get("text", ""))
+        for idx, unit in enumerate(units, start=1):
+            safe_unit = sanitize_historical_review_text(unit, manuscript_title=manuscript)
+            issue_type = infer_issue_type(unit)
+            decision_tier = infer_decision_tier(unit, record.get("decision", ""), reviewer_id)
+            design_type = infer_design_type_from_text(unit)
+            issue = ReviewIssue(
+                paper_id=paper_id,
+                review_file=review_file,
+                journal=record.get("journal", ""),
+                decision=record.get("decision", ""),
+                review_round=round_label,
+                reviewer_id=reviewer_id,
+                atomic_issue_id=f"{paper_id}_{_slugify_id(reviewer_id)}_{idx:02d}",
+                issue_text=safe_unit,
+                issue_type=issue_type,
+                decision_tier=decision_tier,
+                action_requested=sanitize_historical_review_text(
+                    infer_action_requested(unit),
+                    manuscript_title=manuscript,
+                ),
+                tone=infer_tone(unit),
+                paper_section=infer_paper_section(unit),
+                reviewer_confidence=infer_reviewer_confidence(unit),
+                design_type=design_type if design_type != "unclear" else record_design,
+                source_kind=record.get("source_kind", REVIEW_MEMORY_SOURCE_KIND),
+                matched_paper_files=matched_files,
+                match_status=match_status,
+                quality_flag=(
+                    "low_confidence"
+                    if record.get("quality_flag") == "low_confidence"
+                    else ("use" if issue_type != "other" or len(unit.split()) >= 12 else "use_for_style_only")
+                ),
+            )
+            issues.append(issue)
+    return issues
+
+
+def load_review_corpus(
+    archive_root: str | Path = DEFAULT_REVIEW_ARCHIVE_PATH,
+    include_low_confidence: bool = False,
+) -> Dict[str, Any]:
+    """Load archived review markdown, paper matches, and atomized issues."""
+    root = Path(archive_root)
+    if not root.exists():
+        raise FileNotFoundError(f"Review archive not found: {root}")
+    paper_matches = parse_paper_matches(root / "papers" / "PAPER_MATCHES.md", archive_root=root)
+    raw_exports = load_raw_review_exports(root)
+    records: List[Dict[str, Any]] = []
+    issues: List[Dict[str, Any]] = []
+    excluded_records: List[str] = []
+    for md_path in sorted(root.rglob("*.md")):
+        rel = md_path.relative_to(root)
+        if rel.parts[0] in {"papers", RAW_REVIEW_EXPORT_DIR} or rel.name in {"README.md", "index.md"}:
+            continue
+        is_low_confidence = bool(rel.parts and rel.parts[0] in LOW_CONFIDENCE_REVIEW_DIRS)
+        if is_low_confidence and not include_low_confidence:
+            excluded_records.append(str(rel))
+            continue
+        record = parse_review_markdown(md_path, archive_root=root)
+        raw_record = raw_exports.get(record["review_file"])
+        if raw_record:
+            record["sections"] = raw_record.get("sections", [])
+            record["raw_text"] = raw_record.get("raw_text", "")
+            record["source_kind"] = RAW_REVIEW_SOURCE_KIND
+            record["raw_export_file"] = raw_record.get("raw_export_file", "")
+            if raw_record.get("gmail_id"):
+                record["gmail_id"] = raw_record["gmail_id"]
+        record["paper_id"] = _pseudonymous_paper_id(record)
+        record["quality_flag"] = "low_confidence" if is_low_confidence else "use"
+        match_info = paper_matches.get(record["review_file"], {})
+        record["matched_paper_files"] = match_info.get("matched_paper_files", [])
+        record["match_status"] = match_info.get("match_status", "")
+        records.append(record)
+        issues.extend(issue.to_dict() for issue in atomize_review_record(record, match_info))
+
+    return {
+        "archive_root": str(root),
+        "records": records,
+        "issues": issues,
+        "paper_matches": paper_matches,
+        "stats": {
+            "records": len(records),
+            "issues": len(issues),
+            "excluded_low_confidence_records": len(excluded_records),
+            "records_with_papers": sum(1 for record in records if record.get("matched_paper_files")),
+            "matched_pdf_files": len({pdf for record in records for pdf in record.get("matched_paper_files", [])}),
+            "source_kind": REVIEW_MEMORY_SOURCE_KIND,
+            "raw_review_records": sum(1 for record in records if record.get("source_kind") == RAW_REVIEW_SOURCE_KIND),
+        },
+        "excluded_records": excluded_records,
+    }
+
+
+def _token_set(text: str) -> set[str]:
+    stop = {
+        "the", "and", "or", "to", "of", "in", "a", "an", "for", "with", "that",
+        "this", "is", "are", "be", "as", "by", "on", "it", "from", "their",
+        "paper", "manuscript", "reviewer", "review",
+        "study", "article", "analysis", "design",
+    }
+    return {
+        token
+        for token in re.findall(r"[a-z0-9_]+", text.lower())
+        if len(token) > 2 and token not in stop
+    }
+
+
+def lexical_similarity(left: str, right: str) -> float:
+    left_tokens = _token_set(left)
+    right_tokens = _token_set(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+
+
+def retrieve_similar_review_issues(
+    query: str,
+    corpus: Dict[str, Any],
+    top_k: int = 5,
+    issue_type: str | None = None,
+    decision_tier: str | None = None,
+    design_type: str | None = None,
+    min_similarity: float = REVIEW_MEMORY_MIN_SIMILARITY,
+    include_style_only: bool = False,
+) -> List[Dict[str, Any]]:
+    """Retrieve similar historical issue examples with transparent scoring.
+
+    This remains a local baseline, but it avoids unrelated fallback examples and
+    uses available issue metadata to break ties. Embedding retrieval can replace
+    the lexical core later.
+    """
+    candidates = []
+    query_design = design_type or infer_design_type_from_text(query)
+    query_tokens = _token_set(query)
+    for issue in corpus.get("issues", []):
+        if issue.get("quality_flag") != "use" and not include_style_only:
+            continue
+        if issue_type and issue.get("issue_type") != issue_type:
+            continue
+        if decision_tier and issue.get("decision_tier") != decision_tier:
+            continue
+        issue_tokens = _token_set(issue.get("issue_text", ""))
+        shared_tokens = query_tokens & issue_tokens
+        if len(shared_tokens) < 2:
+            continue
+        lexical_score = lexical_similarity(query, issue.get("issue_text", ""))
+        if lexical_score < min_similarity:
+            continue
+        metadata_bonus = 0.0
+        if query_design != "unclear" and issue.get("design_type") == query_design:
+            metadata_bonus += 0.04
+        if issue_type and issue.get("issue_type") == issue_type:
+            metadata_bonus += 0.03
+        if issue.get("decision_tier") == "potential_rejection_reason":
+            metadata_bonus += 0.01
+        score = min(1.0, lexical_score + metadata_bonus)
+        enriched = issue.copy()
+        enriched["similarity"] = round(score, 4)
+        enriched["lexical_similarity"] = round(lexical_score, 4)
+        enriched["shared_terms"] = sorted(shared_tokens)
+        candidates.append(enriched)
+    candidates.sort(key=lambda item: (item["similarity"], item.get("decision_tier") == "potential_rejection_reason"), reverse=True)
+    return candidates[:top_k]
+
+
+def build_review_memory_query(review_text: str, evidence_map: Dict[str, Any] | None = None) -> str:
+    """Build a retrieval query from design metadata and reviewable manuscript text."""
+    parts: List[str] = []
+    if evidence_map:
+        extracted = evidence_map.get("extracted", {})
+        design = extracted.get("research_design", {})
+        if isinstance(design, dict):
+            parts.append(str(design.get("design_type", "")))
+            parts.append(str(design.get("rationale", "")))
+        profile = evidence_map.get("substantive_profile", {})
+        parts.extend(profile.get("designs", []) if isinstance(profile.get("designs"), list) else [])
+        parts.extend(profile.get("key_risks", []) if isinstance(profile.get("key_risks"), list) else [])
+        for finding in evidence_map.get("substantive_checks", []):
+            if finding.get("status") in {"needs_review", "not_found"}:
+                parts.append(str(finding.get("category", "")))
+                parts.append(str(finding.get("rationale", "")))
+                parts.append(str(finding.get("suggested_check", "")))
+    parts.append(review_text[:2500])
+    return "\n".join(part for part in parts if part).strip()
+
+
+def build_review_memory_context(
+    query: str,
+    corpus: Dict[str, Any],
+    top_k: int = 5,
+    issue_type: str | None = None,
+    design_type: str | None = None,
+) -> str:
+    examples = retrieve_similar_review_issues(
+        query,
+        corpus,
+        top_k=top_k,
+        issue_type=issue_type,
+        design_type=design_type,
+    )
+    if not examples:
+        return ""
+    rows = []
+    for idx, issue in enumerate(examples, start=1):
+        rows.append(
+            "\n".join(
+                [
+                    f"Example {idx}:",
+                    f"- issue_type: {issue.get('issue_type')}",
+                    f"- decision_tier: {issue.get('decision_tier')}",
+                    f"- paper_section: {issue.get('paper_section')}",
+                    f"- design_type: {issue.get('design_type')}",
+                    f"- tone: {issue.get('tone')}",
+                    f"- provenance: digest-derived anonymized issue pattern",
+                    f"- pattern: {issue.get('issue_text')}",
+                ]
+            )
+        )
+    return (
+        "Historical reviewer examples for tone, specificity, and prioritization only. "
+        "These are digest-derived anonymized issue patterns, not raw referee quotations. "
+        "Do not import facts from these examples into the current manuscript review.\n\n"
+        + "\n\n".join(rows)
+    )
+
+
+def score_reviewer_likelihood(
+    issue_text: str,
+    corpus: Dict[str, Any],
+    issue_type: str | None = None,
+    design_type: str | None = None,
+    top_k: int = 5,
+) -> Dict[str, Any]:
+    similar = retrieve_similar_review_issues(
+        issue_text,
+        corpus,
+        top_k=top_k,
+        issue_type=issue_type,
+        design_type=design_type,
+    )
+    max_similarity = max((item["similarity"] for item in similar), default=0.0)
+    actionability_bonus = 0.15 if infer_action_requested(issue_text) else 0.0
+    type_bonus = 0.1 if issue_type and any(item.get("issue_type") == issue_type for item in similar) else 0.0
+    reviewer_likelihood = min(1.0, max_similarity + actionability_bonus + type_bonus)
+    return {
+        "reviewer_likelihood_score": round(reviewer_likelihood, 4),
+        "max_historical_similarity": round(max_similarity, 4),
+        "similar_issue_ids": [item["atomic_issue_id"] for item in similar],
+    }
+
+
+def annotate_reviewer_calibration(
+    proposals: List[Dict[str, Any]],
+    corpus: Dict[str, Any],
+    design_type: str | None = None,
+) -> List[Dict[str, Any]]:
+    """Attach reviewer-likelihood and decision-risk scores to proposals.
+
+    These scores are intentionally separate from scientific-validity scores. A
+    reviewer-likely issue is not necessarily correct, and a valid issue may be
+    absent from the historical corpus.
+    """
+    annotated = []
+    for proposal in proposals:
+        item = proposal.copy()
+        issue_type = infer_issue_type(
+            " ".join([item.get("issue_family", ""), item.get("dimension", ""), item.get("text", "")])
+        )
+        likelihood = score_reviewer_likelihood(
+            item.get("text", ""),
+            corpus,
+            issue_type=None if issue_type == "other" else issue_type,
+            design_type=design_type,
+        )
+        severity = float(item.get("verified_severity", item.get("severity", 3)) or 3)
+        evidence_support = float(item.get("evidence_support", item.get("specificity", 3)) or 3)
+        reviewer_score = likelihood["reviewer_likelihood_score"]
+        decision_risk = min(
+            1.0,
+            0.45 * (severity / 5.0)
+            + 0.25 * (evidence_support / 5.0)
+            + 0.30 * reviewer_score,
+        )
+        item.update(likelihood)
+        item["reviewer_likelihood_issue_type"] = issue_type
+        item["decision_risk_score"] = round(decision_risk, 4)
+        annotated.append(item)
+    return annotated
+
+
+ISSUE_MATCH_CONCEPTS = {
+    "novelty_contribution": [
+        "novelty", "contribution", "value added", "incremental", "prior work",
+        "existing literature", "differentiate", "not new", "under-studied",
+    ],
+    "theory_development": [
+        "theory", "theoretical", "argument", "hypothesis", "scope condition",
+        "conditions under which", "variation", "typical case", "critical case",
+        "deviant case",
+    ],
+    "mechanism": [
+        "mechanism", "process", "why", "how", "channel", "pathway", "mediate",
+        "behavioral mechanism",
+    ],
+    "external_validity": [
+        "external validity", "generalizability", "generalizability", "scope",
+        "case study", "single case", "broader", "other cases",
+    ],
+    "identification": [
+        "identification", "causal", "parallel trends", "pre-trend", "pretrend",
+        "event study", "diff-in-diff", "difference-in-differences",
+        "differences-in-differences", "placebo", "robustness",
+    ],
+    "measurement_data": [
+        "measurement", "measure", "data", "sample", "coding", "variable",
+        "residualized", "residualised", "black boxing", "predicts variation",
+    ],
+    "petition_responsiveness": [
+        "petition", "petitions", "citizen demands", "grievance", "grievances",
+        "responsiveness", "responsive", "performative", "substantive response",
+    ],
+    "housing_allocation": [
+        "housing", "construction", "new-built", "new built", "units",
+        "allocation", "allocated", "building houses", "flat",
+    ],
+    "time_dynamics": [
+        "time", "dynamics", "persistent", "persistence", "stock", "flow",
+        "after 1971", "late 1980s", "1963", "1971", "1989",
+    ],
+    "protest_unrest": [
+        "protest", "protests", "unrest", "1953", "demonstrations",
+        "mass support", "public support",
+    ],
+    "qualitative_archival": [
+        "qualitative", "archival", "archive", "direct evidence",
+        "internal government documents", "secondary sources",
+    ],
+    "claim_overreach": [
+        "overclaim", "overstated", "claim", "claims", "language",
+        "propositions", "not test", "untested",
+    ],
+    "uncertainty_inference": [
+        "confidence interval", "confidence intervals", "standard errors",
+        "uncertainty", "precision", "statistical significance",
+    ],
+    "presentation_clarity": [
+        "clarity", "terminology", "writing", "figure", "table", "title",
+        "appendix", "wording",
+    ],
+}
+
+ISSUE_MATCH_SYNONYMS = {
+    "diffindiff": [
+        "difference-in-differences", "differences-in-differences",
+        "difference in differences", "diff in diff", "did",
+    ],
+    "pretrend": ["pre-trend", "pretrend", "pre treatment", "pre-treatment"],
+    "responsiveness": ["responsive", "respond", "responds", "response"],
+    "generalizability": ["generalizability", "generalisability", "external validity"],
+    "novelty": ["novelty", "new", "innovative", "contribution", "value added"],
+    "uncertainty": ["confidence interval", "confidence intervals", "standard errors"],
+    "petition": ["petition", "petitions", "grievance", "grievances"],
+}
+
+ISSUE_MATCH_STOPWORDS = {
+    "the", "and", "or", "to", "of", "in", "a", "an", "for", "with", "that",
+    "this", "is", "are", "be", "as", "by", "on", "it", "from", "their",
+    "paper", "manuscript", "reviewer", "review", "study", "article",
+    "analysis", "design", "problem", "evidence", "author", "authors",
+    "would", "could", "should", "also", "need", "needs", "main", "major",
+    "minor", "point", "issue", "issues", "text", "report", "reports",
+    "comment", "comments", "concern", "concerns", "question", "questions",
+    "first", "second", "third", "overall", "current", "present", "work",
+    "reader", "readers", "section", "figure", "table", "appendix",
+}
+
+
+def _normalize_issue_match_text(text: str) -> str:
+    normalized = (text or "").lower()
+    normalized = normalized.replace("\u2019", "'").replace("\u2013", "-").replace("\u2014", "-")
+    for canonical, variants in ISSUE_MATCH_SYNONYMS.items():
+        for variant in variants:
+            normalized = re.sub(rf"\b{re.escape(variant)}\b", canonical, normalized)
+    return normalized
+
+
+def _stem_issue_token(token: str) -> str:
+    token = token.lower()
+    if len(token) > 6 and token.endswith("ies"):
+        return token[:-3] + "y"
+    for suffix in ["ization", "isation", "iveness", "ments", "ment", "ingly", "edly", "ing", "ed", "es", "s"]:
+        if len(token) > len(suffix) + 4 and token.endswith(suffix):
+            return token[: -len(suffix)]
+    return token
+
+
+def issue_match_terms(text: str) -> set[str]:
+    normalized = _normalize_issue_match_text(text)
+    return {
+        _stem_issue_token(token)
+        for token in re.findall(r"[a-z0-9_]+", normalized)
+        if len(token) > 2 and token not in ISSUE_MATCH_STOPWORDS
+    }
+
+
+def issue_match_concepts(text: str) -> set[str]:
+    normalized = _normalize_issue_match_text(text)
+    concepts = set()
+    for concept, keywords in ISSUE_MATCH_CONCEPTS.items():
+        if any(keyword in normalized for keyword in keywords):
+            concepts.add(concept)
+    return concepts
+
+
+def issue_match_features(issue: Dict[str, Any], text_key: str = "text") -> Dict[str, float]:
+    text = issue.get(text_key, "") or issue.get("issue_text", "")
+    terms = issue_match_terms(text)
+    concepts = issue_match_concepts(text)
+    features: Dict[str, float] = defaultdict(float)
+    for term in terms:
+        features[f"term:{term}"] += 1.0
+    for concept in concepts:
+        features[f"concept:{concept}"] += 2.8
+    issue_type = issue.get("issue_type") or infer_issue_type(text)
+    if issue_type and issue_type != "other":
+        features[f"type:{issue_type}"] += 1.8
+    section = issue.get("paper_section")
+    if section and section != "unspecified":
+        features[f"section:{section}"] += 1.0
+    design = issue.get("design_type") or infer_design_type_from_text(text)
+    if design and design != "unclear":
+        features[f"design:{design}"] += 1.2
+    action = issue.get("action_requested", "")
+    for term in issue_match_terms(action):
+        features[f"action:{term}"] += 1.2
+    return dict(features)
+
+
+def weighted_cosine_similarity(left: Dict[str, float], right: Dict[str, float]) -> float:
+    if not left or not right:
+        return 0.0
+    shared = set(left) & set(right)
+    numerator = sum(left[key] * right[key] for key in shared)
+    left_norm = sum(value * value for value in left.values()) ** 0.5
+    right_norm = sum(value * value for value in right.values()) ** 0.5
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return numerator / (left_norm * right_norm)
+
+
+def semantic_issue_similarity(
+    generated_issue: Dict[str, Any],
+    human_issue: Dict[str, Any],
+) -> Dict[str, Any]:
+    generated_text = generated_issue.get("text", "")
+    human_text = human_issue.get("issue_text", human_issue.get("text", ""))
+    gen_features = issue_match_features(generated_issue, text_key="text")
+    human_features = issue_match_features(human_issue, text_key="issue_text")
+    semantic_score = weighted_cosine_similarity(gen_features, human_features)
+    lexical_score = lexical_similarity(generated_text, human_text)
+    gen_terms = issue_match_terms(generated_text)
+    human_terms = issue_match_terms(human_text)
+    gen_concepts = issue_match_concepts(generated_text)
+    human_concepts = issue_match_concepts(human_text)
+    shared_terms = sorted(gen_terms & human_terms)
+    shared_concepts = sorted(gen_concepts & human_concepts)
+    issue_type_match = (
+        (generated_issue.get("issue_type") or infer_issue_type(generated_text))
+        == (human_issue.get("issue_type") or infer_issue_type(human_text))
+    )
+    combined = min(
+        1.0,
+        0.62 * semantic_score
+        + 0.23 * lexical_score
+        + 0.08 * min(1.0, len(shared_concepts) / 2.0)
+        + 0.07 * (1.0 if issue_type_match else 0.0),
+    )
+    return {
+        "score": combined,
+        "semantic_score": semantic_score,
+        "lexical_score": lexical_score,
+        "shared_terms": shared_terms[:12],
+        "shared_concepts": shared_concepts,
+        "issue_type_match": issue_type_match,
+    }
+
+
+def verify_issue_match_label(
+    similarity: Dict[str, Any],
+    match_threshold: float = 0.24,
+    partial_threshold: float = 0.15,
+) -> Tuple[str, str]:
+    shared_concepts = similarity.get("shared_concepts", [])
+    shared_terms = similarity.get("shared_terms", [])
+    score = similarity.get("score", 0.0)
+    semantic = similarity.get("semantic_score", 0.0)
+    if score >= match_threshold and (len(shared_concepts) >= 1 or len(shared_terms) >= 3):
+        return "matched", "semantic score clears match threshold with overlapping issue concepts/terms"
+    if semantic >= 0.30 and len(shared_concepts) >= 2:
+        return "matched", "high semantic overlap across multiple issue concepts"
+    if score >= partial_threshold and (shared_concepts or len(shared_terms) >= 2):
+        return "partially_matched", "semantic score clears partial threshold with some overlap"
+    return "novel_or_unmatched", "insufficient semantic overlap with held-out review issues"
+
+
+def compare_generated_to_human_issues(
+    generated_issues: List[Dict[str, Any]],
+    human_issues: List[Dict[str, Any]],
+    top_k: int = 8,
+    match_threshold: float = 0.24,
+    partial_threshold: float = 0.15,
+) -> Dict[str, Any]:
+    """Compute local semantic-overlap metrics for held-out review evaluation."""
+    generated_top = generated_issues[:top_k]
+    matches = []
+    matched_human_ids = set()
+    major_human_ids = {
+        issue.get("atomic_issue_id")
+        for issue in human_issues
+        if issue.get("decision_tier") in {"potential_rejection_reason", "major_revision_issue"}
+    }
+    for generated in generated_top:
+        best = None
+        best_similarity = None
+        best_score = 0.0
+        for human in human_issues:
+            similarity = semantic_issue_similarity(generated, human)
+            score = similarity["score"]
+            if score > best_score:
+                best = human
+                best_similarity = similarity
+                best_score = score
+        if best is None:
+            label = "novel_or_unmatched"
+            reason = "no held-out human issue candidates"
+            best_similarity = {
+                "semantic_score": 0.0,
+                "lexical_score": 0.0,
+                "shared_terms": [],
+                "shared_concepts": [],
+                "issue_type_match": False,
+            }
+        else:
+            label, reason = verify_issue_match_label(
+                best_similarity or {},
+                match_threshold=match_threshold,
+                partial_threshold=partial_threshold,
+            )
+            if label in {"matched", "partially_matched"}:
+                matched_human_ids.add(best.get("atomic_issue_id"))
+        match_row = {
+            "generated_id": generated.get("id"),
+            "best_human_issue_id": best.get("atomic_issue_id") if best else None,
+            "similarity": round(best_score, 4),
+            "semantic_similarity": round((best_similarity or {}).get("semantic_score", 0.0), 4),
+            "lexical_similarity": round((best_similarity or {}).get("lexical_score", 0.0), 4),
+            "shared_terms": (best_similarity or {}).get("shared_terms", []),
+            "shared_concepts": (best_similarity or {}).get("shared_concepts", []),
+            "issue_type_match": (best_similarity or {}).get("issue_type_match", False),
+            "label": label,
+            "match_reason": reason,
+        }
+        matches.append(match_row)
+
+    human_recall = len(matched_human_ids) / len(human_issues) if human_issues else 0.0
+    major_recall = len(matched_human_ids & major_human_ids) / len(major_human_ids) if major_human_ids else 0.0
+    precision_like = sum(1 for item in matches if item["label"] in {"matched", "partially_matched"}) / len(generated_top) if generated_top else 0.0
+    return {
+        "human_issue_recall_at_k": round(human_recall, 4),
+        "major_issue_recall_at_k": round(major_recall, 4),
+        "reviewer_likelihood_precision_at_k": round(precision_like, 4),
+        "matches": matches,
+    }
+
+
+def _review_corpus_stats(
+    records: List[Dict[str, Any]],
+    issues: List[Dict[str, Any]],
+    excluded_records: List[str] | None = None,
+) -> Dict[str, Any]:
+    excluded_records = excluded_records or []
+    return {
+        "records": len(records),
+        "issues": len(issues),
+        "excluded_low_confidence_records": len(excluded_records),
+        "records_with_papers": sum(1 for record in records if record.get("matched_paper_files")),
+        "matched_pdf_files": len({pdf for record in records for pdf in record.get("matched_paper_files", [])}),
+        "source_kind": REVIEW_MEMORY_SOURCE_KIND,
+        "raw_review_records": sum(1 for record in records if record.get("source_kind") == RAW_REVIEW_SOURCE_KIND),
+    }
+
+
+def filter_review_corpus_for_holdout(
+    corpus: Dict[str, Any],
+    heldout_paper_id: str,
+) -> Dict[str, Any]:
+    """Return a training corpus that excludes all records/issues for one paper."""
+    heldout_review_files = {
+        record.get("review_file", "")
+        for record in corpus.get("records", [])
+        if record.get("paper_id") == heldout_paper_id
+    }
+    train_records = [
+        record
+        for record in corpus.get("records", [])
+        if record.get("paper_id") != heldout_paper_id
+    ]
+    train_issues = [
+        issue
+        for issue in corpus.get("issues", [])
+        if issue.get("paper_id") != heldout_paper_id
+    ]
+    train_matches = {
+        review_file: match
+        for review_file, match in corpus.get("paper_matches", {}).items()
+        if review_file not in heldout_review_files
+    }
+    low_confidence_excluded = list(corpus.get("excluded_records", []))
+    excluded_records = low_confidence_excluded + sorted(heldout_review_files)
+    stats = _review_corpus_stats(train_records, train_issues, low_confidence_excluded)
+    stats["heldout_records"] = len(heldout_review_files)
+    return {
+        "archive_root": corpus.get("archive_root", ""),
+        "records": train_records,
+        "issues": train_issues,
+        "paper_matches": train_matches,
+        "stats": stats,
+        "excluded_records": excluded_records,
+        "holdout_paper_id": heldout_paper_id,
+    }
+
+
+def _group_records_by_paper(corpus: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, Dict[str, Any]] = {}
+    issues_by_paper: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for issue in corpus.get("issues", []):
+        issues_by_paper[issue.get("paper_id", "")].append(issue)
+
+    for record in corpus.get("records", []):
+        paper_id = record.get("paper_id")
+        if not paper_id:
+            continue
+        item = grouped.setdefault(
+            paper_id,
+            {
+                "paper_id": paper_id,
+                "review_files": [],
+                "journals": set(),
+                "decisions": set(),
+                "matched_paper_files": set(),
+            },
+        )
+        item["review_files"].append(record.get("review_file", ""))
+        if record.get("journal"):
+            item["journals"].add(record.get("journal"))
+        if record.get("decision"):
+            item["decisions"].add(record.get("decision"))
+        item["matched_paper_files"].update(record.get("matched_paper_files", []))
+
+    for paper_id, item in grouped.items():
+        human_issues = issues_by_paper.get(paper_id, [])
+        item["human_issue_count"] = len(human_issues)
+        item["major_issue_count"] = sum(
+            1
+            for issue in human_issues
+            if issue.get("decision_tier") in {"potential_rejection_reason", "major_revision_issue"}
+        )
+        item["issue_types"] = sorted({issue.get("issue_type", "other") for issue in human_issues})
+        item["journals"] = sorted(item["journals"])
+        item["decisions"] = sorted(item["decisions"])
+        item["matched_paper_files"] = sorted(item["matched_paper_files"])
+        item["existing_paper_files"] = [
+            path for path in item["matched_paper_files"] if Path(path).exists()
+        ]
+    return grouped
+
+
+def build_review_holdout_splits(
+    corpus: Dict[str, Any],
+    require_existing_pdf: bool = True,
+    max_splits: int | None = None,
+    paper_ids: List[str] | None = None,
+) -> List[Dict[str, Any]]:
+    """Build whole-paper holdouts from the review corpus.
+
+    Each split holds out every review round for a pseudonymous paper ID, then
+    trains/retrieves from the remaining records only.
+    """
+    requested = set(paper_ids or [])
+    splits = []
+    grouped = _group_records_by_paper(corpus)
+    for paper_id, item in sorted(grouped.items(), key=lambda pair: pair[0]):
+        if requested and paper_id not in requested:
+            continue
+        if item.get("human_issue_count", 0) == 0:
+            continue
+        if require_existing_pdf and not item.get("existing_paper_files"):
+            continue
+        train_corpus = filter_review_corpus_for_holdout(corpus, paper_id)
+        split = {
+            **item,
+            "train_record_count": train_corpus["stats"]["records"],
+            "train_issue_count": train_corpus["stats"]["issues"],
+        }
+        splits.append(split)
+        if max_splits is not None and len(splits) >= max_splits:
+            break
+    return splits
+
+
+def extract_text_from_paper_file(path: str | Path) -> Tuple[str, str]:
+    """Extract paper text for eval planning without exiting the process."""
+    paper_path = Path(path)
+    if not paper_path.exists():
+        return "", "missing_file"
+    suffix = paper_path.suffix.lower()
+    if suffix in {".txt", ".md", ".tex"}:
+        try:
+            return paper_path.read_text(encoding="utf-8"), "ok"
+        except UnicodeDecodeError:
+            return paper_path.read_text(encoding="latin-1"), "ok"
+        except OSError as exc:
+            return "", f"read_error:{exc}"
+    if suffix == ".pdf":
+        try:
+            import fitz  # pymupdf
+        except ImportError:
+            return "", "pymupdf_not_installed"
+        try:
+            doc = fitz.open(paper_path)
+            text = "\n".join(page.get_text() for page in doc)
+            doc.close()
+        except Exception as exc:
+            return "", f"pdf_extract_error:{exc}"
+        if not text.strip():
+            return "", "empty_pdf_text"
+        return text, "ok"
+    return "", f"unsupported_file_type:{suffix}"
+
+
+def _extract_first_holdout_paper_text(split: Dict[str, Any]) -> Tuple[str, str, str]:
+    for paper_file in split.get("existing_paper_files", []):
+        text, status = extract_text_from_paper_file(paper_file)
+        if text.strip():
+            return text, status, paper_file
+    if split.get("matched_paper_files"):
+        first = split["matched_paper_files"][0]
+        text, status = extract_text_from_paper_file(first)
+        return text, status, first
+    return "", "no_matched_paper_file", ""
+
+
+def _generated_issues_for_eval(pipeline_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    selection = pipeline_result.get("selection", {})
+    if selection.get("high_quality"):
+        return selection["high_quality"]
+    if pipeline_result.get("scored"):
+        return pipeline_result["scored"]
+    if pipeline_result.get("proposals"):
+        return pipeline_result["proposals"]
+    return []
+
+
+async def run_historical_review_eval(
+    archive_root: str | Path = DEFAULT_REVIEW_ARCHIVE_PATH,
+    output_path: str | Path | None = None,
+    max_splits: int | None = None,
+    paper_ids: List[str] | None = None,
+    run_api: bool = False,
+    include_low_confidence: bool = False,
+    require_existing_pdf: bool = True,
+    num_agents: int = 8,
+    gen_model: str = GENERATION_MODEL,
+    top_k: int = 5,
+    routing: ModelRoutingConfig | None = None,
+) -> Dict[str, Any]:
+    """Plan or run whole-paper historical-review evaluation.
+
+    Dry-run mode extracts matched papers and estimates costs only. API mode runs
+    the full feedback pipeline with the held-out paper removed from review memory.
+    """
+    routing = routing or build_model_routing(gen_model=gen_model)
+    corpus = load_review_corpus(archive_root, include_low_confidence=include_low_confidence)
+    splits = build_review_holdout_splits(
+        corpus,
+        require_existing_pdf=require_existing_pdf,
+        max_splits=max_splits,
+        paper_ids=paper_ids,
+    )
+    issues_by_paper: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for issue in corpus.get("issues", []):
+        issues_by_paper[issue.get("paper_id", "")].append(issue)
+
+    split_results = []
+    total_estimated_cost = 0.0
+    for split in splits:
+        paper_id = split["paper_id"]
+        train_corpus = filter_review_corpus_for_holdout(corpus, paper_id)
+        paper_text, paper_text_status, paper_file = _extract_first_holdout_paper_text(split)
+        item = {
+            "paper_id": paper_id,
+            "review_files": split.get("review_files", []),
+            "journals": split.get("journals", []),
+            "decisions": split.get("decisions", []),
+            "matched_paper_file": paper_file,
+            "paper_text_status": paper_text_status,
+            "human_issue_count": split.get("human_issue_count", 0),
+            "major_issue_count": split.get("major_issue_count", 0),
+            "issue_types": split.get("issue_types", []),
+            "train_record_count": train_corpus["stats"]["records"],
+            "train_issue_count": train_corpus["stats"]["issues"],
+            "status": "planned",
+        }
+        if paper_text.strip():
+            cost = estimate_cost_before_run(
+                paper_text,
+                num_agents=num_agents,
+                gen_model=gen_model,
+                top_k=top_k,
+                routing=routing,
+                review_corpus=train_corpus,
+            )
+            item["estimated_cost_usd"] = round(cost["estimated_total_cost_usd"], 6)
+            item["estimated_prompt_tokens"] = sum(
+                stage.get("prompt_tokens", 0) for stage in cost.get("stages", {}).values()
+            )
+            total_estimated_cost += cost["estimated_total_cost_usd"]
+        else:
+            item["status"] = "skipped_no_extractable_paper_text"
+
+        if run_api and paper_text.strip():
+            pipeline_result = await full_feedback_pipeline(
+                paper_text,
+                num_agents=num_agents,
+                gen_model=gen_model,
+                top_k=top_k,
+                routing=routing,
+                review_corpus=train_corpus,
+            )
+            generated = _generated_issues_for_eval(pipeline_result)
+            human_issues = issues_by_paper.get(paper_id, [])
+            item["generated_issue_count"] = len(generated)
+            item["generated_issue_summaries"] = [
+                {
+                    "id": issue.get("id"),
+                    "issue_family": issue.get("issue_family"),
+                    "dimension": issue.get("dimension"),
+                    "text": _shorten_for_triage(issue.get("text", ""), max_chars=1200),
+                    "decision_risk_score": issue.get("decision_risk_score"),
+                    "reviewer_likelihood_score": issue.get("reviewer_likelihood_score"),
+                }
+                for issue in generated
+            ]
+            item["metrics"] = compare_generated_to_human_issues(
+                generated,
+                human_issues,
+                top_k=top_k,
+            )
+            item["actual_usage"] = pipeline_result.get("actual_usage", {})
+            item["status"] = "api_evaluated"
+        elif run_api:
+            item["status"] = "skipped_no_extractable_paper_text"
+        elif paper_text.strip():
+            item["status"] = "dry_run_estimated"
+
+        split_results.append(item)
+
+    evaluated = [item for item in split_results if item.get("metrics")]
+    summary = {
+        "archive_root": str(archive_root),
+        "mode": "api" if run_api else "dry_run",
+        "splits": len(split_results),
+        "api_evaluated_splits": len(evaluated),
+        "extractable_splits": sum(1 for item in split_results if item.get("paper_text_status") == "ok"),
+        "total_estimated_cost_usd": round(total_estimated_cost, 6),
+        "corpus_records": corpus["stats"]["records"],
+        "corpus_issue_candidates": corpus["stats"]["issues"],
+        "low_confidence_records_excluded": corpus["stats"]["excluded_low_confidence_records"],
+    }
+    if evaluated:
+        summary["mean_human_issue_recall_at_k"] = round(
+            sum(item["metrics"]["human_issue_recall_at_k"] for item in evaluated) / len(evaluated),
+            4,
+        )
+        summary["mean_major_issue_recall_at_k"] = round(
+            sum(item["metrics"]["major_issue_recall_at_k"] for item in evaluated) / len(evaluated),
+            4,
+        )
+        summary["mean_reviewer_likelihood_precision_at_k"] = round(
+            sum(item["metrics"]["reviewer_likelihood_precision_at_k"] for item in evaluated) / len(evaluated),
+            4,
+        )
+
+    result = {
+        "summary": summary,
+        "splits": split_results,
+    }
+    if output_path:
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        result["output_path"] = str(out)
+    return result
+
+
+def render_historical_review_eval_summary(result: Dict[str, Any]) -> str:
+    summary = result.get("summary", {})
+    lines = [
+        "# Historical Review Evaluation",
+        "",
+        f"- Mode: {summary.get('mode', 'dry_run')}",
+        f"- Corpus records: {summary.get('corpus_records', 0)}",
+        f"- Corpus issue candidates: {summary.get('corpus_issue_candidates', 0)}",
+        f"- Low-confidence records excluded: {summary.get('low_confidence_records_excluded', 0)}",
+        f"- Holdout splits: {summary.get('splits', 0)}",
+        f"- Extractable splits: {summary.get('extractable_splits', 0)}",
+        f"- API-evaluated splits: {summary.get('api_evaluated_splits', 0)}",
+        f"- Estimated total API cost: ${summary.get('total_estimated_cost_usd', 0.0):.4f}",
+    ]
+    if summary.get("api_evaluated_splits"):
+        lines.extend(
+            [
+                f"- Mean human issue recall@K: {summary.get('mean_human_issue_recall_at_k', 0.0):.4f}",
+                f"- Mean major issue recall@K: {summary.get('mean_major_issue_recall_at_k', 0.0):.4f}",
+                f"- Mean reviewer-likelihood precision@K: {summary.get('mean_reviewer_likelihood_precision_at_k', 0.0):.4f}",
+            ]
+        )
+    if result.get("output_path"):
+        lines.append(f"- Saved JSON: `{result['output_path']}`")
+
+    lines.extend(["", "## Splits", "", "| Paper ID | Reviews | Issues | Major | Paper text | Est. cost | Status |", "|---|---:|---:|---:|---|---:|---|"])
+    for item in result.get("splits", []):
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    _markdown_table_cell(item.get("paper_id")),
+                    _markdown_table_cell(len(item.get("review_files", []))),
+                    _markdown_table_cell(item.get("human_issue_count", 0)),
+                    _markdown_table_cell(item.get("major_issue_count", 0)),
+                    _markdown_table_cell(item.get("paper_text_status", "")),
+                    _markdown_table_cell(f"${item.get('estimated_cost_usd', 0.0):.4f}" if item.get("estimated_cost_usd") is not None else ""),
+                    _markdown_table_cell(item.get("status", "")),
+                ]
+            )
+            + " |"
+        )
+    return "\n".join(lines)
+
+
+def build_reviewer_style_rewrite_messages(
+    structured_issue: Dict[str, Any],
+    examples: List[Dict[str, Any]] | None = None,
+) -> List[Dict[str, str]]:
+    """Build a safe rewriter prompt using historical comments as style examples only."""
+    example_text = ""
+    if examples:
+        lines = []
+        for idx, example in enumerate(examples[:3], start=1):
+            lines.append(f"Example {idx}: {example.get('issue_text', '')}")
+        example_text = "\n\nHistorical style examples, not evidence for the current paper:\n" + "\n".join(lines)
+    user_content = (
+        "Rewrite this verified manuscript issue as a concise quantitative-social-science reviewer comment.\n"
+        "Do not add facts, evidence, variables, or claims beyond the structured issue.\n\n"
+        f"Structured issue:\n```json\n{json.dumps(structured_issue, ensure_ascii=False, indent=2)}\n```"
+        f"{example_text}"
+    )
+    return [
+        {"role": "system", "content": "You rewrite verified manuscript issues in credible journal-review style without adding substance."},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def render_review_corpus_summary(corpus: Dict[str, Any]) -> str:
+    stats = corpus.get("stats", {})
+    by_journal: Dict[str, int] = defaultdict(int)
+    by_issue_type: Dict[str, int] = defaultdict(int)
+    for record in corpus.get("records", []):
+        by_journal[record.get("journal", "Unknown")] += 1
+    for issue in corpus.get("issues", []):
+        by_issue_type[issue.get("issue_type", "other")] += 1
+    lines = [
+        "# Review Corpus Summary",
+        "",
+        f"- Archive root: `{corpus.get('archive_root', '')}`",
+        f"- Review records: {stats.get('records', 0)}",
+        f"- Issue candidates: {stats.get('issues', 0)}",
+        f"- Source kind: {stats.get('source_kind', REVIEW_MEMORY_SOURCE_KIND)}",
+        f"- Raw Gmail review records: {stats.get('raw_review_records', 0)}",
+        "- Source note: raw Gmail sidecars are used when available; remaining records use extracted review digests.",
+        f"- Low-confidence records excluded: {stats.get('excluded_low_confidence_records', 0)}",
+        f"- Records with matched papers: {stats.get('records_with_papers', 0)}",
+        f"- Unique matched PDF files: {stats.get('matched_pdf_files', 0)}",
+        "",
+        "## Records by Journal",
+    ]
+    for journal, count in sorted(by_journal.items()):
+        lines.append(f"- {journal}: {count}")
+    lines.append("")
+    lines.append("## Issues by Type")
+    for issue_type, count in sorted(by_issue_type.items()):
+        lines.append(f"- {issue_type}: {count}")
+    return "\n".join(lines)
 
 
 # -------------------------------------------------------------------
@@ -1395,6 +2777,7 @@ def _generation_user_prompt(
     paper_text: str,
     worker_id: int,
     evidence_map: Dict[str, Any] | None = None,
+    review_memory_context: str = "",
 ) -> str:
     if evidence_map:
         manuscript_context = _generation_context_from_evidence_map(evidence_map)
@@ -1402,6 +2785,16 @@ def _generation_user_prompt(
     else:
         manuscript_context = f"Paper text:\n```text\n{paper_text}\n```"
         context_label = "Paper text"
+
+    memory_block = ""
+    if review_memory_context:
+        memory_block = f"""
+
+Historical review memory:
+```text
+{review_memory_context}
+```
+""".rstrip()
 
     return f"""
 You review the manuscript context below and provide exactly one feedback proposal.
@@ -1434,6 +2827,8 @@ Technical specificity must be excerpt-grounded:
 - The "text" field must mention the most important evidence IDs in prose, e.g. "Evidence: P003, TBL001."
 - Treat the substantive checklist as an omission guide, not as proof of a flaw. If you use it, frame the concern
   as a diagnostic check unless manuscript evidence directly supports a stronger claim.
+- If historical review memory is provided, use it only to calibrate tone, specificity, and likely reviewer
+  salience. Do not import facts, paper details, reviewer claims, or evidence from historical examples.
 
 Persona consistency:
 - Conceptual/theoretical feedback: do not introduce econometric implementation details.
@@ -1453,6 +2848,7 @@ Return a JSON object with exactly these fields:
 
 {context_label}:
 {manuscript_context}
+{memory_block}
 """.strip()
 
 
@@ -1468,6 +2864,7 @@ def _generation_messages(
     paper_text: str,
     worker_id: int,
     evidence_map: Dict[str, Any] | None = None,
+    review_memory_context: str = "",
 ) -> List[Dict[str, str]]:
     system_prompt = GENERATION_SYSTEM_PROMPT
     if persona_prompt:
@@ -1480,6 +2877,7 @@ def _generation_messages(
                 paper_text,
                 worker_id,
                 evidence_map=evidence_map,
+                review_memory_context=review_memory_context,
             ),
         },
     ]
@@ -1740,6 +3138,9 @@ def build_editorial_issue_inputs(selection: Dict[str, Any]) -> List[Dict[str, An
                 "measurement_sample_risk": proposal.get("measurement_sample_risk"),
                 "interpretation_risk": proposal.get("interpretation_risk"),
                 "theory_contribution_risk": proposal.get("theory_contribution_risk"),
+                "reviewer_likelihood_score": proposal.get("reviewer_likelihood_score"),
+                "decision_risk_score": proposal.get("decision_risk_score"),
+                "similar_historical_issue_ids": proposal.get("similar_issue_ids", []),
                 "existing_mitigation_signal": (
                     "demoted_by_verifier" if proposal.get("verification_status") == "demote" else ""
                 ),
@@ -1958,10 +3359,26 @@ EDITORIAL_TRIAGE_SYSTEM_PROMPT = (
 )
 
 
-def _editorial_triage_messages(selection: Dict[str, Any]) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]]]:
+def _editorial_triage_messages(
+    selection: Dict[str, Any],
+    review_memory_context: str = "",
+) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]]]:
     issue_inputs = build_editorial_issue_inputs(selection)
     profile_json = json.dumps(selection.get("substantive_profile", {}), ensure_ascii=False)
     issues_json = json.dumps(issue_inputs, ensure_ascii=False)
+    memory_block = ""
+    if review_memory_context:
+        memory_block = f"""
+
+Historical review memory for calibration only:
+```text
+{review_memory_context}
+```
+
+Use this memory only to calibrate reviewer likelihood, decision relevance, tone, and specificity.
+Do not import historical-paper facts or cite historical comments as evidence.
+""".rstrip()
+
     user_content = f"""
 Classify each issue into a clear problem list with separate rejection-risk and decision-tier labels.
 
@@ -2035,6 +3452,7 @@ Issue inputs:
 ```json
 {issues_json}
 ```
+{memory_block}
 """.strip()
     return [
         {"role": "system", "content": EDITORIAL_TRIAGE_SYSTEM_PROMPT},
@@ -2045,10 +3463,11 @@ Issue inputs:
 async def editorial_triage(
     selection: Dict[str, Any],
     model: str = TRIAGE_MODEL,
+    review_memory_context: str = "",
     tracker: "UsageTracker | None" = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Classify verified issues by publication-decision relevance."""
-    messages, issue_inputs = _editorial_triage_messages(selection)
+    messages, issue_inputs = _editorial_triage_messages(selection, review_memory_context=review_memory_context)
     if not issue_inputs:
         empty = {
             "editorial_diagnosis": "mostly_minor_issues",
@@ -2540,12 +3959,14 @@ async def generate_single_proposal(
     persona_prompt: str,
     model: str = GENERATION_MODEL,
     evidence_map: Dict[str, Any] | None = None,
+    review_memory_context: str = "",
 ) -> Dict[str, Any]:
     messages = _generation_messages(
         persona_prompt,
         paper_text,
         worker_id,
         evidence_map=evidence_map,
+        review_memory_context=review_memory_context,
     )
     result = await chat_json(
         messages,
@@ -2588,6 +4009,7 @@ async def generate_all_proposals(
     workers: List[Dict[str, Any]],  # CHANGED: Now accepts specific worker list
     model: str,  # CHANGED: Now accepts specific model
     evidence_map: Dict[str, Any] | None = None,
+    review_memory_context: str = "",
     tracker: "UsageTracker | None" = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Generate proposals with partial failure recovery.
@@ -2603,6 +4025,7 @@ async def generate_all_proposals(
             paper_text,
             assignment["id"],
             evidence_map=evidence_map,
+            review_memory_context=review_memory_context,
         )
         # Use retry wrapper for transient errors
         task = chat_json_with_retry(
@@ -3566,6 +4989,8 @@ def estimate_cost_before_run(
     gen_model: str = GENERATION_MODEL,
     top_k: int = 5,
     routing: ModelRoutingConfig | None = None,
+    review_corpus_path: str | None = None,
+    review_corpus: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Estimate cost BEFORE running the pipeline.
 
@@ -3586,9 +5011,19 @@ def estimate_cost_before_run(
 
     evidence_index = build_deterministic_evidence_index(paper_text)
     review_text = evidence_index.get("safe_text", paper_text)
+    design_type = _design_type_from_evidence_map(evidence_index)
+    review_memory_context = ""
+    if review_corpus_path or review_corpus:
+        corpus = review_corpus or load_review_corpus(review_corpus_path)
+        review_memory_query = build_review_memory_query(review_text, evidence_map=evidence_index)
+        review_memory_context = build_review_memory_context(
+            review_memory_query,
+            corpus,
+            top_k=5,
+            design_type=design_type,
+        )
 
     # Create mock workers to get persona prompts
-    design_type = _design_type_from_evidence_map(evidence_index)
     workers = create_worker_assignments(num_agents, design_type=design_type)
 
     # Estimate evidence-map extraction stage
@@ -3604,6 +5039,7 @@ def estimate_cost_before_run(
             review_text,
             worker["id"],
             evidence_map=evidence_index,
+            review_memory_context=review_memory_context,
         )
         gen_prompt_tokens += _count_message_tokens(messages, gen_model)
     gen_completion_tokens = num_agents * 150  # ~100 words + JSON overhead per proposal
@@ -3681,7 +5117,10 @@ def estimate_cost_before_run(
             "suggested_check": "Justify standard errors and clustering.",
         }
     ]
-    triage_messages, _triage_issue_inputs = _editorial_triage_messages(sample_selection)
+    triage_messages, _triage_issue_inputs = _editorial_triage_messages(
+        sample_selection,
+        review_memory_context=review_memory_context,
+    )
     triage_prompt_tokens = _count_message_tokens(triage_messages, triage_model)
     triage_completion_tokens = 800
 
@@ -3817,6 +5256,8 @@ async def full_feedback_pipeline(
     routing: ModelRoutingConfig | None = None,
     include_evidence_appendix: bool = False,
     include_audit_appendix: bool = False,
+    review_corpus_path: str | None = None,
+    review_corpus: Dict[str, Any] | None = None,
     progress_callback: Any = None,
 ) -> Dict[str, Any]:
     """Run the full async feedback pipeline for a single paper.
@@ -3845,9 +5286,29 @@ async def full_feedback_pipeline(
     review_text = evidence_map.get("safe_text", "").strip()
     if not review_text:
         raise ValueError("No reviewable manuscript text remained after safety quarantine.")
+    design_type = _design_type_from_evidence_map(evidence_map)
+    review_memory_context = ""
+    active_review_corpus: Dict[str, Any] | None = review_corpus
+    review_corpus_summary: Dict[str, Any] | None = None
+    if review_corpus_path or active_review_corpus:
+        if active_review_corpus is None:
+            active_review_corpus = load_review_corpus(review_corpus_path)
+        review_memory_query = build_review_memory_query(review_text, evidence_map=evidence_map)
+        review_memory_context = build_review_memory_context(
+            review_memory_query,
+            active_review_corpus,
+            top_k=5,
+            design_type=design_type,
+        )
+        review_corpus_summary = active_review_corpus.get("stats", {})
+        if review_memory_context:
+            _progress(
+                "  Review memory enabled: "
+                f"{review_corpus_summary.get('records', 0)} records, "
+                f"{review_corpus_summary.get('issues', 0)} issue candidates"
+            )
 
     # 1. Create workers dynamically
-    design_type = _design_type_from_evidence_map(evidence_map)
     workers = create_worker_assignments(num_agents, design_type=design_type)
 
     tracker.set_stage("generation")
@@ -3857,6 +5318,7 @@ async def full_feedback_pipeline(
         workers,
         routing.generation,
         evidence_map=evidence_map,
+        review_memory_context=review_memory_context,
         tracker=tracker,
     )
 
@@ -3881,6 +5343,8 @@ async def full_feedback_pipeline(
         escalation_model=routing.escalation,
         tracker=tracker,
     )
+    if active_review_corpus:
+        scored = annotate_reviewer_calibration(scored, active_review_corpus, design_type=design_type)
 
     selection = await select_and_classify(scored, top_k, tracker=tracker)
     selection["substantive_profile"] = evidence_map.get("substantive_profile", {})
@@ -3954,6 +5418,7 @@ async def full_feedback_pipeline(
     triage, issue_inputs = await editorial_triage(
         selection,
         model=routing.editorial_triage,
+        review_memory_context=review_memory_context,
         tracker=tracker,
     )
     selection["editorial_triage"] = triage
@@ -3971,6 +5436,12 @@ async def full_feedback_pipeline(
         "editorial_triage": triage,
         "meta_review": meta,
     }
+    if review_corpus_summary is not None:
+        result["review_corpus"] = {
+            "path": review_corpus_path or "in_memory_review_corpus",
+            "stats": review_corpus_summary,
+            "memory_examples_used": bool(review_memory_context),
+        }
     result["report_markdown"] = build_report_with_evidence_lookup(
         meta,
         evidence_map,
@@ -4018,8 +5489,34 @@ __all__ = [
     "ESCALATION_MODEL",
     "TRIAGE_MODEL",
     "DEFAULT_MODEL_ROUTING",
+    "DEFAULT_REVIEW_ARCHIVE_PATH",
+    "RAW_REVIEW_EXPORT_DIR",
+    "RAW_REVIEW_SOURCE_KIND",
+    "ReviewIssue",
     "build_model_routing",
     "current_model_options",
+    "parse_review_markdown",
+    "load_raw_review_exports",
+    "parse_paper_matches",
+    "atomize_review_record",
+    "load_review_corpus",
+    "sanitize_historical_review_text",
+    "infer_design_type_from_text",
+    "build_review_memory_query",
+    "retrieve_similar_review_issues",
+    "build_review_memory_context",
+    "score_reviewer_likelihood",
+    "annotate_reviewer_calibration",
+    "semantic_issue_similarity",
+    "verify_issue_match_label",
+    "compare_generated_to_human_issues",
+    "filter_review_corpus_for_holdout",
+    "build_review_holdout_splits",
+    "extract_text_from_paper_file",
+    "run_historical_review_eval",
+    "render_historical_review_eval_summary",
+    "build_reviewer_style_rewrite_messages",
+    "render_review_corpus_summary",
     "sanitize_manuscript_text",
     "build_deterministic_evidence_index",
     "format_evidence_index_for_prompt",
@@ -4163,15 +5660,23 @@ def _format_cost_estimate(cost: Dict[str, Any]) -> str:
             f"completion={summary.get('completion_tokens', 0)}{cached_str}{req_str}, "
             f"cost={cost_str}"
         )
-    total_cost = cost.get("total_cost_usd")
+    total_cost = cost.get("total_cost_usd", cost.get("estimated_total_cost_usd"))
     total_cost_str = f"${total_cost:.4f}" if total_cost is not None else "n/a"
     total_cached = cost.get("total_cached_tokens", 0)
     cached_note = f", cached={total_cached}" if total_cached else ""
     total_requests = cost.get("total_requests")
     req_note = f", reqs={total_requests}" if total_requests else ""
+    total_prompt = cost.get(
+        "total_prompt_tokens",
+        sum(stage.get("prompt_tokens", 0) for stage in cost.get("stages", {}).values()),
+    )
+    total_completion = cost.get(
+        "total_completion_tokens",
+        sum(stage.get("completion_tokens", 0) for stage in cost.get("stages", {}).values()),
+    )
     lines.append(
-        f"- TOTAL: prompt={cost.get('total_prompt_tokens', 0)}, "
-        f"completion={cost.get('total_completion_tokens', 0)}{cached_note}{req_note}, "
+        f"- TOTAL: prompt={total_prompt}, "
+        f"completion={total_completion}{cached_note}{req_note}, "
         f"cost={total_cost_str}"
     )
     return "\n".join(lines)
@@ -4240,7 +5745,98 @@ def main(argv: List[str] | None = None) -> int:
         action="store_true",
         help="Include the full deterministic substantive coverage audit and evidence lookup appendices in CLI output.",
     )
+    parser.add_argument(
+        "--review-corpus",
+        type=str,
+        default=None,
+        help="Optional path to a historical review archive for reviewer-memory calibration.",
+    )
+    parser.add_argument(
+        "--inspect-review-corpus",
+        action="store_true",
+        help="Load the review corpus, print a local summary, and exit without calling the API.",
+    )
+    parser.add_argument(
+        "--include-low-confidence-reviews",
+        action="store_true",
+        help="When inspecting the review corpus, include forwarded/low-confidence review records.",
+    )
+    parser.add_argument(
+        "--eval-review-corpus",
+        type=str,
+        default=None,
+        help="Build a whole-paper held-out review-eval plan for a review archive.",
+    )
+    parser.add_argument(
+        "--eval-output",
+        type=str,
+        default=None,
+        help="Optional JSON output path for --eval-review-corpus.",
+    )
+    parser.add_argument(
+        "--eval-limit",
+        type=int,
+        default=None,
+        help="Maximum number of held-out paper splits to plan or run.",
+    )
+    parser.add_argument(
+        "--eval-paper-id",
+        action="append",
+        default=None,
+        help="Restrict review eval to a pseudonymous paper ID. Can be passed multiple times.",
+    )
+    parser.add_argument(
+        "--eval-run-api",
+        action="store_true",
+        help="Actually run paid API evaluation for held-out splits. Omit for dry-run planning only.",
+    )
+    parser.add_argument(
+        "--eval-allow-missing-pdf",
+        action="store_true",
+        help="Include held-out splits even if no matched paper PDF currently exists.",
+    )
     args = parser.parse_args(argv)
+
+    if args.inspect_review_corpus:
+        corpus_path = args.review_corpus or DEFAULT_REVIEW_ARCHIVE_PATH
+        try:
+            corpus = load_review_corpus(
+                corpus_path,
+                include_low_confidence=args.include_low_confidence_reviews,
+            )
+        except (FileNotFoundError, OSError) as e:
+            print(f"Review corpus error: {e}", file=sys.stderr)
+            return 1
+        print(render_review_corpus_summary(corpus))
+        return 0
+
+    if args.eval_review_corpus:
+        try:
+            result = asyncio.run(
+                run_historical_review_eval(
+                    archive_root=args.eval_review_corpus,
+                    output_path=args.eval_output,
+                    max_splits=args.eval_limit,
+                    paper_ids=args.eval_paper_id,
+                    run_api=args.eval_run_api,
+                    include_low_confidence=args.include_low_confidence_reviews,
+                    require_existing_pdf=not args.eval_allow_missing_pdf,
+                    num_agents=args.agents,
+                    gen_model=args.model,
+                    top_k=args.top_k,
+                )
+            )
+        except (FileNotFoundError, OSError) as e:
+            print(f"Review eval error: {e}", file=sys.stderr)
+            return 1
+        print(render_historical_review_eval_summary(result))
+        if not args.eval_run_api:
+            print(
+                "\nDry run only: no API calls were made. "
+                "Use --eval-run-api only after reviewing the estimated cost.",
+                file=sys.stderr,
+            )
+        return 0
 
     # Validate mutually exclusive input sources
     input_sources = sum([
@@ -4306,6 +5902,7 @@ def main(argv: List[str] | None = None) -> int:
                 top_k=args.top_k,
                 include_evidence_appendix=args.include_evidence_appendix,
                 include_audit_appendix=args.include_audit_appendix,
+                review_corpus_path=args.review_corpus,
             )
         )
     except (RuntimeError, ValueError) as e:
