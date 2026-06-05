@@ -293,7 +293,12 @@ def _progress(message: str) -> None:
 # -------------------------------------------------------------------
 
 
-REVIEW_SECTION_RE = re.compile(r"^##\s+(Editor|Reviewer\s+#?\s*\d+|Review\s+#?\s*\d+)\s*$", re.I | re.M)
+REVIEW_SECTION_RE = re.compile(
+    r"^\s*##\s+"
+    r"(Associate\s+Editor|Editor|Reviewer\s+#?\s*\d+|Review\s+#?\s*\d+|Referee\s+#?\s*\d+(?:\s+attachment)?)"
+    r"\s*$",
+    re.I | re.M,
+)
 MD_TABLE_ROW_RE = re.compile(r"^\|(.+)\|\s*$")
 
 ISSUE_TYPE_KEYWORDS = [

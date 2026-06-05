@@ -83,6 +83,39 @@ class ReviewCorpusParsingTests(unittest.TestCase):
         self.assertEqual(record["source_kind"], fp.REVIEW_MEMORY_SOURCE_KIND)
         self.assertEqual({section["reviewer_id"] for section in record["sections"]}, {"Editor", "Reviewer 1", "Reviewer 2"})
 
+    def test_parse_review_markdown_accepts_indented_referee_headings(self):
+        tmp = tempfile.TemporaryDirectory()
+        root = Path(tmp.name)
+        self.addCleanup(tmp.cleanup)
+        (root / "other_journals").mkdir()
+        path = root / "other_journals" / "jrssa.md"
+        path.write_text(
+            """    # JRSSA - Example Paper
+
+    - Date: 2026-01-03
+    - Decision: Revise and resubmit
+
+    ## Associate Editor
+The associate editor summarized the main methodological concern.
+
+## Referee 1
+The referee asked for more simulation evidence and clearer derivations.
+
+## Referee 2 attachment
+The attached report raised concerns about confidence interval coverage.
+""",
+            encoding="utf-8",
+        )
+
+        record = fp.parse_review_markdown(path, archive_root=root)
+
+        self.assertEqual(record["journal"], "JRSSA")
+        self.assertEqual(record["manuscript"], "Example Paper")
+        self.assertEqual(
+            [section["reviewer_id"] for section in record["sections"]],
+            ["Associate Editor", "Referee 1", "Referee 2 attachment"],
+        )
+
     def test_load_review_corpus_attaches_paper_matches_and_atomizes_issues(self):
         tmp, root = make_archive()
         self.addCleanup(tmp.cleanup)
