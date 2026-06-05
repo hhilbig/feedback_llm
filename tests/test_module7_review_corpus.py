@@ -222,6 +222,122 @@ class ReviewMemoryTests(unittest.TestCase):
         self.assertIn("theory_development", metrics["matches"][0]["shared_concepts"])
         self.assertGreater(metrics["reviewer_likelihood_precision_at_k"], 0)
 
+    def test_human_target_cleanup_excludes_non_substantive_atoms(self):
+        human = [
+            {
+                "atomic_issue_id": "drop_title",
+                "issue_text": "Petitions and Housing Construction in the GDR. They are attached below.",
+                "issue_type": "other",
+                "quality_flag": "use_for_style_only",
+            },
+            {
+                "atomic_issue_id": "drop_decision",
+                "issue_text": "Based on these reviews, I am afraid that I cannot accept this paper for publication.",
+                "issue_type": "other",
+                "quality_flag": "use",
+            },
+            {
+                "atomic_issue_id": "drop_praise",
+                "issue_text": "The paper is well-written, clear, and uses appropriate methods within the boundaries of the available data.",
+                "issue_type": "measurement",
+                "quality_flag": "use",
+            },
+            {
+                "atomic_issue_id": "drop_citation",
+                "issue_text": "See either Dimitrov 2023 or the work on Chinese air pollution.",
+                "issue_type": "other",
+                "quality_flag": "use_for_style_only",
+            },
+            {
+                "atomic_issue_id": "keep_novelty",
+                "issue_text": "The contribution remains insufficiently novel relative to the existing literature.",
+                "issue_type": "theory",
+                "quality_flag": "use",
+            },
+            {
+                "atomic_issue_id": "keep_figure",
+                "issue_text": "Figure 1 would benefit from the inclusion of confidence intervals.",
+                "issue_type": "presentation",
+                "quality_flag": "use_for_style_only",
+            },
+            {
+                "atomic_issue_id": "keep_question",
+                "issue_text": "Were the units the same across the country or did they vary over geography?",
+                "issue_type": "other",
+                "quality_flag": "use_for_style_only",
+            },
+        ]
+
+        targets, excluded = fp.filter_human_review_target_issues(human)
+
+        self.assertEqual(
+            {issue["atomic_issue_id"] for issue in targets},
+            {"keep_novelty", "keep_figure", "keep_question"},
+        )
+        self.assertEqual(len(excluded), 4)
+        reasons = {item["reason"] for item in excluded}
+        self.assertIn("title_or_attachment_fragment", reasons)
+        self.assertIn("editor_or_decision_boilerplate", reasons)
+        self.assertIn("generic_praise", reasons)
+        self.assertIn("citation_fragment", reasons)
+
+    def test_human_issue_clusters_deduplicate_repeated_concerns(self):
+        human = [
+            {
+                "atomic_issue_id": "h1",
+                "issue_text": "The contribution relative to the existing literature is unclear and needs sharper framing.",
+                "issue_type": "theory",
+                "decision_tier": "major_revision_issue",
+                "paper_section": "theory_framing",
+                "reviewer_id": "Reviewer 1",
+                "review_file": "ajps/example.md",
+            },
+            {
+                "atomic_issue_id": "h2",
+                "issue_text": "The paper should better differentiate its contribution from prior work and explain what is new.",
+                "issue_type": "theory",
+                "decision_tier": "major_revision_issue",
+                "paper_section": "theory_framing",
+                "reviewer_id": "Reviewer 2",
+                "review_file": "ajps/example.md",
+            },
+            {
+                "atomic_issue_id": "h3",
+                "issue_text": "The difference-in-differences design needs full pre-treatment leads and a joint pre-trend test.",
+                "issue_type": "identification",
+                "decision_tier": "major_revision_issue",
+                "paper_section": "identification",
+                "reviewer_id": "Reviewer 1",
+                "review_file": "ajps/example.md",
+            },
+        ]
+        generated = [
+            {
+                "id": 1,
+                "text": "Problem: The novelty and contribution are still underspecified relative to prior work.",
+                "issue_type": "theory",
+            },
+            {
+                "id": 2,
+                "text": "Problem: The manuscript needs a sharper account of what is new in the existing literature.",
+                "issue_type": "theory",
+            },
+        ]
+
+        clusters = fp.cluster_human_review_issues(human)
+        metrics = fp.compare_generated_to_human_issues(generated, human, top_k=2)
+
+        self.assertEqual(len(clusters), 2)
+        self.assertEqual(metrics["human_issue_cluster_count"], 2)
+        self.assertEqual(metrics["matched_human_issue_cluster_count"], 1)
+        self.assertEqual(metrics["human_issue_cluster_recall_at_k"], 0.5)
+        self.assertEqual(metrics["human_issue_candidate_count"], 3)
+        self.assertEqual(metrics["human_issue_target_count"], 3)
+        self.assertEqual(metrics["reviewer_likelihood_precision_at_k"], 1.0)
+        self.assertEqual(metrics["deduplicated_reviewer_likelihood_precision_at_k"], 0.5)
+        self.assertEqual(metrics["duplicate_generated_cluster_matches"], 1)
+        self.assertEqual(metrics["matches"][0]["best_human_cluster_size"], 2)
+
     def test_semantic_eval_does_not_match_unrelated_concern(self):
         human = [
             {
@@ -404,9 +520,13 @@ class HistoricalReviewEvalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["summary"]["splits"], 1)
         self.assertGreater(result["summary"]["total_estimated_cost_usd"], 0)
         self.assertEqual(result["splits"][0]["status"], "dry_run_estimated")
+        self.assertGreater(result["splits"][0]["human_issue_candidate_count"], 0)
+        self.assertGreater(result["splits"][0]["human_issue_cluster_count"], 0)
         self.assertFalse(mock_pipeline.called)
         rendered = fp.render_historical_review_eval_summary(result)
         self.assertIn("Historical Review Evaluation", rendered)
+        self.assertIn("Targets", rendered)
+        self.assertIn("Clusters", rendered)
 
     async def test_eval_api_mode_uses_filtered_corpus_and_compares_to_human_issues(self):
         tmp, root = make_archive()
@@ -450,6 +570,10 @@ class HistoricalReviewEvalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["splits"][0]["generated_issue_count"], 1)
         self.assertIn("generated_issue_summaries", result["splits"][0])
         self.assertGreater(result["splits"][0]["metrics"]["human_issue_recall_at_k"], 0)
+        self.assertGreater(result["splits"][0]["metrics"]["human_issue_target_count"], 0)
+        self.assertGreater(result["splits"][0]["metrics"]["human_issue_cluster_recall_at_k"], 0)
+        self.assertIn("mean_human_issue_cluster_recall_at_k", result["summary"])
+        self.assertIn("mean_deduplicated_reviewer_likelihood_precision_at_k", result["summary"])
 
 
 if __name__ == "__main__":

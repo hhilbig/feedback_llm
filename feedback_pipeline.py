@@ -5,7 +5,7 @@ import os
 import re
 import sys
 from argparse import ArgumentParser
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -157,6 +157,7 @@ RAW_REVIEW_EXPORT_DIR = "raw_gmail_exports"
 REVIEW_MEMORY_MIN_SIMILARITY = 0.06
 REVIEW_MEMORY_SOURCE_KIND = "review_digest"
 RAW_REVIEW_SOURCE_KIND = "raw_gmail_body"
+HUMAN_ISSUE_CLUSTER_SIMILARITY = 0.50
 
 
 @dataclass(frozen=True)
@@ -762,6 +763,8 @@ def retrieve_similar_review_issues(
     for issue in corpus.get("issues", []):
         if issue.get("quality_flag") != "use" and not include_style_only:
             continue
+        if not include_style_only and human_review_target_filter_reason(issue):
+            continue
         if issue_type and issue.get("issue_type") != issue_type:
             continue
         if decision_tier and issue.get("decision_tier") != decision_tier:
@@ -1130,6 +1133,325 @@ def verify_issue_match_label(
     return "novel_or_unmatched", "insufficient semantic overlap with held-out review issues"
 
 
+HUMAN_TARGET_CRITIQUE_TERMS = [
+    "absence", "absent", "ambiguous", "benefit from", "concern", "confusing", "could consider",
+    "difficult to", "does not", "do not", "fails to", "helpful to", "important to",
+    "failed", "insufficient", "lack", "lacks", "missing", "more detail", "more work",
+    "needs", "not clear", "not convinced", "not enough", "not test",
+    "obvious and established", "over-simplification", "overstated", "puzzling",
+    "should", "unclear", "unconvincing", "underdeveloped", "would benefit",
+    "would encourage",
+]
+
+HUMAN_TARGET_ACTION_TERMS = [
+    *ACTION_KEYWORDS,
+    "add", "clarify", "consider", "discuss", "differentiate", "engage",
+    "explain", "include", "motivate", "provide", "revise", "show",
+]
+
+HUMAN_TARGET_BOILERPLATE_PATTERNS = [
+    re.compile(pattern, re.I)
+    for pattern in [
+        r"\bi have now received the reviews\b",
+        r"\bthey are attached below\b",
+        r"\bthe reviews are mixed\b",
+        r"\bbased on these reviews\b.*\bcannot accept\b",
+        r"\bdisappointing outcome\b.*\banother journal\b",
+        r"\bdo not let this decision discourage\b",
+        r"\bthank you for giving me an opportunity\b",
+    ]
+]
+
+HUMAN_TARGET_GENERIC_PRAISE_PATTERNS = [
+    re.compile(pattern, re.I)
+    for pattern in [
+        r"\bwell[- ]written\b.*\bclear\b.*\bappropriate methods\b",
+        r"\bprofessional in its presentation\b.*\bclear in its argumentation\b",
+        r"\braises an important and timely question\b",
+        r"\bsignificant strengths\b.*\ball reviewers agree\b",
+    ]
+]
+
+HUMAN_TARGET_DESCRIPTIVE_STARTS = (
+    "this paper argues",
+    "this paper considers",
+    "the paper considers whether",
+    "the paper argues that",
+    "the paper show that",
+    "the paper shows that",
+)
+
+
+def _contains_human_target_signal(text: str, issue: Dict[str, Any]) -> bool:
+    lowered = text.lower()
+    if issue.get("action_requested"):
+        return True
+    if "?" in text and not re.search(r"\bdo autocrats respond to citizen demands\b", lowered):
+        return True
+    if any(term in lowered for term in HUMAN_TARGET_CRITIQUE_TERMS):
+        return True
+    if any(term in lowered for term in HUMAN_TARGET_ACTION_TERMS):
+        return True
+    if issue.get("issue_type") != "other" and any(term in lowered for term in ["not", "no ", "without"]):
+        return True
+    return False
+
+
+def _looks_like_citation_fragment(text: str) -> bool:
+    lowered = text.lower().strip()
+    years = re.findall(r"\b(?:19|20)\d{2}\b", text)
+    word_count = len(re.findall(r"[A-Za-z0-9]+", text))
+    if lowered.startswith(("see ", "see,", "see either ")) and word_count <= 18:
+        return True
+    if len(years) >= 2 and word_count <= 28 and ";" in text:
+        return True
+    if len(years) >= 3 and word_count <= 36:
+        return True
+    return False
+
+
+def _looks_like_title_or_attachment_fragment(text: str) -> bool:
+    lowered = text.lower().strip()
+    if not lowered:
+        return True
+    if "they are attached below" in lowered:
+        return True
+    if re.search(r"\bdo autocrats respond to citizen demands\b", lowered):
+        return True
+    if lowered.startswith("petitions and housing construction") and len(lowered.split()) <= 12:
+        return True
+    return False
+
+
+def human_review_target_filter_reason(issue: Dict[str, Any]) -> str:
+    """Return an exclusion reason for non-substantive held-out eval targets."""
+    text = re.sub(r"\s+", " ", issue.get("issue_text") or issue.get("text", "")).strip()
+    if not text:
+        return "empty_text"
+    word_count = len(re.findall(r"[A-Za-z0-9]+", text))
+    has_signal = _contains_human_target_signal(text, issue)
+    if _looks_like_title_or_attachment_fragment(text):
+        return "title_or_attachment_fragment"
+    if any(pattern.search(text) for pattern in HUMAN_TARGET_BOILERPLATE_PATTERNS):
+        return "editor_or_decision_boilerplate"
+    if any(pattern.search(text) for pattern in HUMAN_TARGET_GENERIC_PRAISE_PATTERNS) and not has_signal:
+        return "generic_praise"
+    if _looks_like_citation_fragment(text) and not has_signal:
+        return "citation_fragment"
+    if text.lower().startswith(HUMAN_TARGET_DESCRIPTIVE_STARTS) and not has_signal:
+        return "descriptive_summary"
+    if issue.get("quality_flag") == "use_for_style_only" and not has_signal:
+        return "style_only_fragment"
+    if word_count < 5 and not has_signal:
+        return "too_short"
+    return ""
+
+
+def filter_human_review_target_issues(
+    human_issues: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Split atomized held-out review issues into scored targets and exclusions."""
+    targets = []
+    excluded = []
+    for issue in human_issues:
+        reason = human_review_target_filter_reason(issue)
+        if reason:
+            excluded.append(
+                {
+                    "atomic_issue_id": _human_issue_identifier(issue),
+                    "reason": reason,
+                    "issue_text": _compact_eval_text(issue.get("issue_text") or issue.get("text", "")),
+                }
+            )
+        else:
+            targets.append(issue)
+    return targets, excluded
+
+
+def _target_exclusion_reason_counts(excluded: List[Dict[str, Any]]) -> Dict[str, int]:
+    return dict(sorted(Counter(item.get("reason", "unknown") for item in excluded).items()))
+
+
+DECISION_TIER_PRIORITY = {
+    "potential_rejection_reason": 4,
+    "major_revision_issue": 3,
+    "minor_revision_issue": 2,
+    "nice_to_have": 1,
+    "drop": 0,
+}
+
+
+def _decision_tier_priority(tier: str | None) -> int:
+    return DECISION_TIER_PRIORITY.get(tier or "", 0)
+
+
+def _human_issue_identifier(issue: Dict[str, Any]) -> str:
+    if issue.get("atomic_issue_id"):
+        return str(issue["atomic_issue_id"])
+    text = issue.get("issue_text") or issue.get("text") or json.dumps(issue, sort_keys=True)
+    return "human_issue_" + hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:12]
+
+
+def _human_issue_generated_view(issue: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "text": issue.get("issue_text") or issue.get("text", ""),
+        "issue_type": issue.get("issue_type"),
+        "paper_section": issue.get("paper_section"),
+        "design_type": issue.get("design_type"),
+        "action_requested": issue.get("action_requested", ""),
+    }
+
+
+def _compact_eval_text(text: str, max_chars: int = 420) -> str:
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 1].rstrip() + "..."
+
+
+def _should_cluster_human_issues(
+    similarity: Dict[str, Any],
+    similarity_threshold: float,
+) -> bool:
+    score = similarity.get("score", 0.0)
+    shared_concepts = similarity.get("shared_concepts", [])
+    shared_terms = similarity.get("shared_terms", [])
+    if score >= similarity_threshold and (shared_concepts or len(shared_terms) >= 3):
+        return True
+    return False
+
+
+def _representative_human_issue(issues: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return max(
+        issues,
+        key=lambda issue: (
+            _decision_tier_priority(issue.get("decision_tier")),
+            len(issue.get("issue_text") or issue.get("text", "")),
+            _human_issue_identifier(issue),
+        ),
+    )
+
+
+def _dominant_cluster_value(issues: List[Dict[str, Any]], key: str, default: str = "") -> str:
+    counts = Counter(str(issue.get(key) or default) for issue in issues)
+    if not counts:
+        return default
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _cluster_label_terms(issues: List[Dict[str, Any]], limit: int = 10) -> List[str]:
+    term_counts: Counter[str] = Counter()
+    for issue in issues:
+        text = issue.get("issue_text") or issue.get("text", "")
+        term_counts.update(issue_match_concepts(text))
+        term_counts.update(issue_match_terms(text))
+    return [
+        term
+        for term, _count in sorted(term_counts.items(), key=lambda item: (-item[1], item[0]))[:limit]
+    ]
+
+
+def cluster_human_review_issues(
+    human_issues: List[Dict[str, Any]],
+    similarity_threshold: float = HUMAN_ISSUE_CLUSTER_SIMILARITY,
+) -> List[Dict[str, Any]]:
+    """Greedily group overlapping held-out human review comments into concerns.
+
+    Atomized review comments are useful, but they overstate the target set when
+    multiple reviewers, editors, or sentence splits repeat the same concern.
+    This local clustering creates a deduplicated coverage denominator without
+    using any paid model calls.
+    """
+    sorted_issues = sorted(
+        human_issues,
+        key=lambda issue: (
+            -_decision_tier_priority(issue.get("decision_tier")),
+            issue.get("issue_type", ""),
+            issue.get("reviewer_id", ""),
+            _human_issue_identifier(issue),
+        ),
+    )
+    working: List[Dict[str, Any]] = []
+    for issue in sorted_issues:
+        best_cluster: Dict[str, Any] | None = None
+        best_similarity: Dict[str, Any] | None = None
+        best_score = 0.0
+        issue_view = _human_issue_generated_view(issue)
+        for cluster in working:
+            for member in cluster["members"]:
+                similarity = semantic_issue_similarity(issue_view, member)
+                score = similarity.get("score", 0.0)
+                if score > best_score and _should_cluster_human_issues(
+                    similarity,
+                    similarity_threshold,
+                ):
+                    best_cluster = cluster
+                    best_similarity = similarity
+                    best_score = score
+        if best_cluster is None:
+            working.append(
+                {
+                    "members": [issue],
+                    "merge_scores": [],
+                    "merge_evidence": [],
+                }
+            )
+        else:
+            best_cluster["members"].append(issue)
+            best_cluster["merge_scores"].append(round(best_score, 4))
+            if best_similarity:
+                best_cluster["merge_evidence"].append(
+                    {
+                        "score": round(best_score, 4),
+                        "shared_concepts": best_similarity.get("shared_concepts", []),
+                        "shared_terms": best_similarity.get("shared_terms", []),
+                    }
+                )
+
+    clusters: List[Dict[str, Any]] = []
+    for idx, cluster in enumerate(working, start=1):
+        members = cluster["members"]
+        representative = _representative_human_issue(members)
+        max_tier = max(
+            (issue.get("decision_tier", "") for issue in members),
+            key=_decision_tier_priority,
+            default="",
+        )
+        issue_ids = [_human_issue_identifier(issue) for issue in members]
+        clusters.append(
+            {
+                "cluster_id": f"HC{idx:03d}",
+                "representative_issue_id": _human_issue_identifier(representative),
+                "representative_text": _compact_eval_text(
+                    representative.get("issue_text") or representative.get("text", "")
+                ),
+                "issue_ids": issue_ids,
+                "issue_count": len(issue_ids),
+                "decision_tier": max_tier,
+                "issue_type": _dominant_cluster_value(members, "issue_type", "other"),
+                "paper_section": _dominant_cluster_value(members, "paper_section", "unspecified"),
+                "reviewer_ids": sorted(
+                    {
+                        str(issue.get("reviewer_id", ""))
+                        for issue in members
+                        if issue.get("reviewer_id")
+                    }
+                ),
+                "source_files": sorted(
+                    {
+                        str(issue.get("review_file", ""))
+                        for issue in members
+                        if issue.get("review_file")
+                    }
+                ),
+                "label_terms": _cluster_label_terms(members),
+                "merge_scores": cluster.get("merge_scores", []),
+                "merge_evidence": cluster.get("merge_evidence", [])[:5],
+            }
+        )
+    return clusters
+
+
 def compare_generated_to_human_issues(
     generated_issues: List[Dict[str, Any]],
     human_issues: List[Dict[str, Any]],
@@ -1138,11 +1460,29 @@ def compare_generated_to_human_issues(
     partial_threshold: float = 0.15,
 ) -> Dict[str, Any]:
     """Compute local semantic-overlap metrics for held-out review evaluation."""
+    human_issue_candidate_count = len(human_issues)
+    human_issues, excluded_human_issues = filter_human_review_target_issues(human_issues)
     generated_top = generated_issues[:top_k]
     matches = []
     matched_human_ids = set()
+    human_clusters = cluster_human_review_issues(human_issues)
+    cluster_by_human_id = {
+        issue_id: cluster["cluster_id"]
+        for cluster in human_clusters
+        for issue_id in cluster.get("issue_ids", [])
+    }
+    cluster_size_by_id = {
+        cluster["cluster_id"]: cluster.get("issue_count", 0)
+        for cluster in human_clusters
+    }
+    major_cluster_ids = {
+        cluster["cluster_id"]
+        for cluster in human_clusters
+        if cluster.get("decision_tier") in {"potential_rejection_reason", "major_revision_issue"}
+    }
+    matched_cluster_counts: Counter[str] = Counter()
     major_human_ids = {
-        issue.get("atomic_issue_id")
+        _human_issue_identifier(issue)
         for issue in human_issues
         if issue.get("decision_tier") in {"potential_rejection_reason", "major_revision_issue"}
     }
@@ -1174,10 +1514,18 @@ def compare_generated_to_human_issues(
                 partial_threshold=partial_threshold,
             )
             if label in {"matched", "partially_matched"}:
-                matched_human_ids.add(best.get("atomic_issue_id"))
+                best_issue_id = _human_issue_identifier(best)
+                matched_human_ids.add(best_issue_id)
+                best_cluster_id = cluster_by_human_id.get(best_issue_id)
+                if best_cluster_id:
+                    matched_cluster_counts[best_cluster_id] += 1
+        best_issue_id = _human_issue_identifier(best) if best else None
+        best_cluster_id = cluster_by_human_id.get(best_issue_id) if best_issue_id else None
         match_row = {
             "generated_id": generated.get("id"),
-            "best_human_issue_id": best.get("atomic_issue_id") if best else None,
+            "best_human_issue_id": best_issue_id,
+            "best_human_cluster_id": best_cluster_id,
+            "best_human_cluster_size": cluster_size_by_id.get(best_cluster_id, 0) if best_cluster_id else 0,
             "similarity": round(best_score, 4),
             "semantic_similarity": round((best_similarity or {}).get("semantic_score", 0.0), 4),
             "lexical_similarity": round((best_similarity or {}).get("lexical_score", 0.0), 4),
@@ -1191,11 +1539,35 @@ def compare_generated_to_human_issues(
 
     human_recall = len(matched_human_ids) / len(human_issues) if human_issues else 0.0
     major_recall = len(matched_human_ids & major_human_ids) / len(major_human_ids) if major_human_ids else 0.0
-    precision_like = sum(1 for item in matches if item["label"] in {"matched", "partially_matched"}) / len(generated_top) if generated_top else 0.0
+    matched_generated_count = sum(
+        1 for item in matches if item["label"] in {"matched", "partially_matched"}
+    )
+    precision_like = matched_generated_count / len(generated_top) if generated_top else 0.0
+    matched_cluster_ids = set(matched_cluster_counts)
+    cluster_recall = len(matched_cluster_ids) / len(human_clusters) if human_clusters else 0.0
+    major_cluster_recall = len(matched_cluster_ids & major_cluster_ids) / len(major_cluster_ids) if major_cluster_ids else 0.0
+    duplicate_cluster_matches = sum(count - 1 for count in matched_cluster_counts.values() if count > 1)
+    deduplicated_precision_like = len(matched_cluster_ids) / len(generated_top) if generated_top else 0.0
     return {
         "human_issue_recall_at_k": round(human_recall, 4),
         "major_issue_recall_at_k": round(major_recall, 4),
+        "human_issue_cluster_recall_at_k": round(cluster_recall, 4),
+        "major_issue_cluster_recall_at_k": round(major_cluster_recall, 4),
         "reviewer_likelihood_precision_at_k": round(precision_like, 4),
+        "deduplicated_reviewer_likelihood_precision_at_k": round(deduplicated_precision_like, 4),
+        "human_issue_candidate_count": human_issue_candidate_count,
+        "human_issue_target_count": len(human_issues),
+        "human_issue_excluded_count": len(excluded_human_issues),
+        "human_issue_excluded_reasons": _target_exclusion_reason_counts(excluded_human_issues),
+        "excluded_human_issues": excluded_human_issues,
+        "human_issue_cluster_count": len(human_clusters),
+        "major_issue_cluster_count": len(major_cluster_ids),
+        "matched_generated_issue_count": matched_generated_count,
+        "matched_human_issue_count": len(matched_human_ids),
+        "matched_human_issue_cluster_count": len(matched_cluster_ids),
+        "duplicate_generated_cluster_matches": duplicate_cluster_matches,
+        "matched_human_cluster_ids": sorted(matched_cluster_ids),
+        "human_issue_clusters": human_clusters,
         "matches": matches,
     }
 
@@ -1285,12 +1657,23 @@ def _group_records_by_paper(corpus: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
         item["matched_paper_files"].update(record.get("matched_paper_files", []))
 
     for paper_id, item in grouped.items():
-        human_issues = issues_by_paper.get(paper_id, [])
+        human_issue_candidates = issues_by_paper.get(paper_id, [])
+        human_issues, excluded_human_issues = filter_human_review_target_issues(human_issue_candidates)
+        human_clusters = cluster_human_review_issues(human_issues)
+        item["human_issue_candidate_count"] = len(human_issue_candidates)
         item["human_issue_count"] = len(human_issues)
+        item["human_issue_excluded_count"] = len(excluded_human_issues)
+        item["human_issue_excluded_reasons"] = _target_exclusion_reason_counts(excluded_human_issues)
         item["major_issue_count"] = sum(
             1
             for issue in human_issues
             if issue.get("decision_tier") in {"potential_rejection_reason", "major_revision_issue"}
+        )
+        item["human_issue_cluster_count"] = len(human_clusters)
+        item["major_issue_cluster_count"] = sum(
+            1
+            for cluster in human_clusters
+            if cluster.get("decision_tier") in {"potential_rejection_reason", "major_revision_issue"}
         )
         item["issue_types"] = sorted({issue.get("issue_type", "other") for issue in human_issues})
         item["journals"] = sorted(item["journals"])
@@ -1431,8 +1814,13 @@ async def run_historical_review_eval(
             "decisions": split.get("decisions", []),
             "matched_paper_file": paper_file,
             "paper_text_status": paper_text_status,
+            "human_issue_candidate_count": split.get("human_issue_candidate_count", 0),
             "human_issue_count": split.get("human_issue_count", 0),
+            "human_issue_excluded_count": split.get("human_issue_excluded_count", 0),
+            "human_issue_excluded_reasons": split.get("human_issue_excluded_reasons", {}),
             "major_issue_count": split.get("major_issue_count", 0),
+            "human_issue_cluster_count": split.get("human_issue_cluster_count", 0),
+            "major_issue_cluster_count": split.get("major_issue_cluster_count", 0),
             "issue_types": split.get("issue_types", []),
             "train_record_count": train_corpus["stats"]["records"],
             "train_issue_count": train_corpus["stats"]["issues"],
@@ -1493,6 +1881,9 @@ async def run_historical_review_eval(
         split_results.append(item)
 
     evaluated = [item for item in split_results if item.get("metrics")]
+    corpus_target_issues, corpus_excluded_targets = filter_human_review_target_issues(
+        corpus.get("issues", [])
+    )
     summary = {
         "archive_root": str(archive_root),
         "mode": "api" if run_api else "dry_run",
@@ -1502,6 +1893,9 @@ async def run_historical_review_eval(
         "total_estimated_cost_usd": round(total_estimated_cost, 6),
         "corpus_records": corpus["stats"]["records"],
         "corpus_issue_candidates": corpus["stats"]["issues"],
+        "corpus_issue_targets": len(corpus_target_issues),
+        "corpus_issue_targets_excluded": len(corpus_excluded_targets),
+        "corpus_issue_target_exclusion_reasons": _target_exclusion_reason_counts(corpus_excluded_targets),
         "low_confidence_records_excluded": corpus["stats"]["excluded_low_confidence_records"],
     }
     if evaluated:
@@ -1513,8 +1907,27 @@ async def run_historical_review_eval(
             sum(item["metrics"]["major_issue_recall_at_k"] for item in evaluated) / len(evaluated),
             4,
         )
+        summary["mean_human_issue_cluster_recall_at_k"] = round(
+            sum(item["metrics"]["human_issue_cluster_recall_at_k"] for item in evaluated) / len(evaluated),
+            4,
+        )
+        summary["mean_major_issue_cluster_recall_at_k"] = round(
+            sum(item["metrics"]["major_issue_cluster_recall_at_k"] for item in evaluated) / len(evaluated),
+            4,
+        )
         summary["mean_reviewer_likelihood_precision_at_k"] = round(
             sum(item["metrics"]["reviewer_likelihood_precision_at_k"] for item in evaluated) / len(evaluated),
+            4,
+        )
+        summary["mean_deduplicated_reviewer_likelihood_precision_at_k"] = round(
+            sum(
+                item["metrics"]["deduplicated_reviewer_likelihood_precision_at_k"]
+                for item in evaluated
+            ) / len(evaluated),
+            4,
+        )
+        summary["mean_duplicate_generated_cluster_matches"] = round(
+            sum(item["metrics"]["duplicate_generated_cluster_matches"] for item in evaluated) / len(evaluated),
             4,
         )
 
@@ -1538,6 +1951,8 @@ def render_historical_review_eval_summary(result: Dict[str, Any]) -> str:
         f"- Mode: {summary.get('mode', 'dry_run')}",
         f"- Corpus records: {summary.get('corpus_records', 0)}",
         f"- Corpus issue candidates: {summary.get('corpus_issue_candidates', 0)}",
+        f"- Corpus scored issue targets: {summary.get('corpus_issue_targets', 0)}",
+        f"- Corpus issue candidates excluded from scoring: {summary.get('corpus_issue_targets_excluded', 0)}",
         f"- Low-confidence records excluded: {summary.get('low_confidence_records_excluded', 0)}",
         f"- Holdout splits: {summary.get('splits', 0)}",
         f"- Extractable splits: {summary.get('extractable_splits', 0)}",
@@ -1549,13 +1964,17 @@ def render_historical_review_eval_summary(result: Dict[str, Any]) -> str:
             [
                 f"- Mean human issue recall@K: {summary.get('mean_human_issue_recall_at_k', 0.0):.4f}",
                 f"- Mean major issue recall@K: {summary.get('mean_major_issue_recall_at_k', 0.0):.4f}",
+                f"- Mean human issue cluster recall@K: {summary.get('mean_human_issue_cluster_recall_at_k', 0.0):.4f}",
+                f"- Mean major issue cluster recall@K: {summary.get('mean_major_issue_cluster_recall_at_k', 0.0):.4f}",
                 f"- Mean reviewer-likelihood precision@K: {summary.get('mean_reviewer_likelihood_precision_at_k', 0.0):.4f}",
+                f"- Mean deduplicated reviewer-likelihood precision@K: {summary.get('mean_deduplicated_reviewer_likelihood_precision_at_k', 0.0):.4f}",
+                f"- Mean duplicate generated cluster matches: {summary.get('mean_duplicate_generated_cluster_matches', 0.0):.4f}",
             ]
         )
     if result.get("output_path"):
         lines.append(f"- Saved JSON: `{result['output_path']}`")
 
-    lines.extend(["", "## Splits", "", "| Paper ID | Reviews | Issues | Major | Paper text | Est. cost | Status |", "|---|---:|---:|---:|---|---:|---|"])
+    lines.extend(["", "## Splits", "", "| Paper ID | Reviews | Candidates | Targets | Excluded | Clusters | Major clusters | Paper text | Est. cost | Status |", "|---|---:|---:|---:|---:|---:|---:|---|---:|---|"])
     for item in result.get("splits", []):
         lines.append(
             "| "
@@ -1563,8 +1982,11 @@ def render_historical_review_eval_summary(result: Dict[str, Any]) -> str:
                 [
                     _markdown_table_cell(item.get("paper_id")),
                     _markdown_table_cell(len(item.get("review_files", []))),
+                    _markdown_table_cell(item.get("human_issue_candidate_count", item.get("human_issue_count", 0))),
                     _markdown_table_cell(item.get("human_issue_count", 0)),
-                    _markdown_table_cell(item.get("major_issue_count", 0)),
+                    _markdown_table_cell(item.get("human_issue_excluded_count", 0)),
+                    _markdown_table_cell(item.get("human_issue_cluster_count", 0)),
+                    _markdown_table_cell(item.get("major_issue_cluster_count", 0)),
                     _markdown_table_cell(item.get("paper_text_status", "")),
                     _markdown_table_cell(f"${item.get('estimated_cost_usd', 0.0):.4f}" if item.get("estimated_cost_usd") is not None else ""),
                     _markdown_table_cell(item.get("status", "")),
@@ -2326,7 +2748,7 @@ def audit_meta_review_substantive_coverage(
 
 
 def _markdown_table_cell(text: Any) -> str:
-    safe = str(text or "")
+    safe = "" if text is None else str(text)
     safe = safe.replace("|", "\\|").replace("\n", " ")
     return safe.strip()
 
@@ -5509,6 +5931,9 @@ __all__ = [
     "annotate_reviewer_calibration",
     "semantic_issue_similarity",
     "verify_issue_match_label",
+    "human_review_target_filter_reason",
+    "filter_human_review_target_issues",
+    "cluster_human_review_issues",
     "compare_generated_to_human_issues",
     "filter_review_corpus_for_holdout",
     "build_review_holdout_splits",
