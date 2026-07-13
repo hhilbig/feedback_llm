@@ -154,7 +154,7 @@ class CostEstimateTests(unittest.TestCase):
         )
 
         self.assertIn("score_escalation", estimate["stages"])
-        self.assertEqual(estimate["stages"]["score_escalation"]["model"], "gpt-5.5")
+        self.assertEqual(estimate["stages"]["score_escalation"]["model"], "gpt-5.6-sol")
 
 
 if __name__ == "__main__":

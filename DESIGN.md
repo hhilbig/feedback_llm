@@ -17,11 +17,16 @@ Paper text
   |     Build deterministic substantive profile and checklist findings
   |     for DD/DDD, inference, repeated cross-sections, and text-as-data
   |
-  |-- Design-aware generation
+  |-- Cold design-aware generation
   |     8 specialized agents produce evidence-linked proposals
   |     Agent block: 2 theorists, 2 rivals, 2 methodologists,
   |     1 design specialist, 1 editor
-  |     Optional anonymized review-digest memory calibrates tone and reviewer salience
+  |     With `--review-prior`, this first pass remains paper-only
+  |
+  |-- Optional structured reviewer-prior gap pass
+  |     Select applicable, unsatisfied priors after the cold pass
+  |     Generate targeted proposals only for missing high-salience checks
+  |     Priors may raise checks but cannot supply facts or evidence support
   |
   |-- Grounding check
   |     Regex guardrail flags missing table, figure, section, appendix,
@@ -47,6 +52,7 @@ Paper text
   |
   |-- Editorial triage
   |     Classify verified issues by publication-decision relevance
+  |     Structured priors can calibrate reviewer likelihood and decision tier
   |     Enforce caps on rejection reasons, major blockers, and non-blocking items
   |
   |-- Editorial report
@@ -83,9 +89,22 @@ Paper text
   local corpus inspection only.
 - `--review-corpus PATH` on a normal run enables private historical-review memory
   for generation and editorial triage.
+- `--review-prior PATH` on a normal run enables the API-safe structured reviewer
+  prior. The pipeline first runs cold generation without the prior, then uses it
+  for targeted post-cold-pass gap checks and editorial triage calibration.
+- `--distill-review-prior PATH` builds the structured reviewer-prior artifact
+  locally from a private review archive without calling the API.
 - `--eval-review-corpus PATH` builds whole-paper held-out splits from the archive,
   estimates per-split API cost, and optionally saves a JSON plan without calling
   the API.
+- `--eval-review-prior-gate PATH` compares three held-out modes: no memory
+  baseline, API-safe structured reviewer prior, and local raw-memory upper bound.
+  Dry-run mode estimates the full three-way cost without calling the API.
+- `--eval-batch-api` routes the reviewer-prior gate's chat-completion calls
+  through OpenAI Batch API. Because the pipeline has dependent stages, batching
+  is stage-by-stage: each concurrent wave is submitted, polled to completion, and
+  then the next local stage proceeds. Local JSONL inputs and a batch manifest are
+  written under the requested batch output directory.
 - `--eval-run-api` actually runs the held-out evaluation. It should be used only
   after reviewing the dry-run estimate because it calls the paid API.
 
@@ -127,22 +146,39 @@ implementation:
   candidates. Dry-run mode estimates costs only and makes no API calls. API-mode
   JSON keeps compact generated-issue summaries so matching logic can be audited
   later without rerunning the paid pipeline.
+- Provides a reviewer-prior deployment gate through
+  `run_review_prior_eval_gate()`. Each split distills the safe prior from training
+  reviews only, with the held-out paper-review pair excluded, then compares
+  baseline, safe-prior, and local raw-memory modes on major human issue-cluster
+  recall, deduplicated reviewer-likelihood precision, unsupported-claim rate, and
+  duplicate laundry-list rate.
+- Provides local reviewer-prior distillation through
+  `distill_review_prior_from_corpus()`. This turns private review issue clusters
+  into a structured, API-safe prior artifact with controlled reviewer-concern
+  templates, executable `raise_if_missing`, `demote_if_present`, and `suppress_if`
+  rules, bucketed support levels, decision-tier priors, and a privacy audit. Exact
+  support counts, issue IDs, review files, and low-support exclusions are written
+  only to the separate local audit metadata file.
 
 The reviewer-likelihood score is intentionally separate from scientific validity.
 A comment can be likely to appear in a referee report without being correct, and a
 valid concern can be absent from the historical corpus.
 
+The reviewer-prior artifact follows the same rule: priors may raise checks, rank
+salience, or shape final wording, but they may not support factual claims or affect
+verification. Manuscript evidence remains the only source of support for a critique.
+
 ### Models and Routing
 
 The model registry is defined in `MODEL_REGISTRY`. Defaults are:
 
-- Generation: `gpt-5.4-mini`
-- Scoring: `gpt-5.4-mini`
-- Verification: `gpt-5.4-mini`
-- Rewrite and simple labels: `gpt-5.4-nano`
-- Editorial triage: `gpt-5.5`
-- Meta-review: `gpt-5.5`
-- Escalation: `gpt-5.5`
+- Generation: `gpt-5.6-terra` (`reasoning_effort="none"`)
+- Scoring: `gpt-5.6-terra` (`reasoning_effort="none"`)
+- Verification: `gpt-5.6-terra` (`reasoning_effort="none"`)
+- Rewrite and simple labels: `gpt-5.6-luna` (`reasoning_effort="none"`)
+- Editorial triage: `gpt-5.6-sol` (`reasoning_effort="medium"`)
+- Meta-review: `gpt-5.6-sol` (`reasoning_effort="medium"`)
+- Escalation: `gpt-5.6-sol` (`reasoning_effort="medium"`)
 
 Previous GPT-5 family models remain allowed for reproducibility. The registry includes
 pricing so estimates and actual usage can be reconciled by stage.

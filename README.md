@@ -55,7 +55,7 @@ The current pipeline has nine stages:
 | **Top-K Proposals** | Number of top insights emphasized in the final report. |
 | **Review mode** | Editorial triage shows clear problems with rejection-risk labels. Comprehensive audit also appends deterministic coverage and evidence appendices. |
 
-Default routing uses `gpt-5.4-mini` for generation, scoring, and verification, `gpt-5.4-nano` for constrained rewrites and simple labeling, and `gpt-5.5` for editorial triage, meta-review, and escalations.
+Default routing uses `gpt-5.6-terra` for generation, scoring, and verification, `gpt-5.6-luna` for constrained rewrites and simple labeling, and `gpt-5.6-sol` for editorial triage, meta-review, and escalations. Reasoning effort is explicitly `none` for Terra/Luna and `medium` for Sol to preserve the effective behavior of the previous routing.
 
 Cost note: each run uses the paid OpenAI API. The app shows an estimate before a run and actual usage afterward.
 
@@ -81,7 +81,7 @@ python -m feedback_pipeline --clipboard
 python -m feedback_pipeline --pdf paper.pdf
 python -m feedback_pipeline --file paper.txt
 
-python -m feedback_pipeline --agents 16 --model gpt-5.4-mini --top-k 10 --file paper.txt
+python -m feedback_pipeline --agents 16 --model gpt-5.6-terra --top-k 10 --file paper.txt
 python -m feedback_pipeline --file paper.txt --include-evidence-appendix
 python -m feedback_pipeline --file paper.txt --include-audit-appendix
 
@@ -99,11 +99,45 @@ python -m feedback_pipeline --inspect-review-corpus --review-corpus /path/to/jou
 # The final report does not expose old review examples.
 python -m feedback_pipeline --file paper.txt --review-corpus /path/to/journal_reviews_inbox_2026-06-04
 
+# Use an API-safe structured reviewer prior. The pipeline runs a cold paper-only
+# pass first, then uses the prior only for targeted gap checks and triage calibration.
+python -m feedback_pipeline --file paper.txt --review-prior outputs/private_review_prior.json
+
+# Distill a local private review archive into an API-safe structured reviewer-prior artifact.
+# The local audit file keeps exact support metadata and should stay out of git.
+python -m feedback_pipeline \
+  --distill-review-prior /path/to/journal_reviews_inbox_2026-06-04 \
+  --review-prior-output outputs/private_review_prior.json \
+  --review-prior-audit-output outputs/private_review_prior.local_audit.json
+
 # Build a whole-paper held-out review-eval plan without calling the API.
 python -m feedback_pipeline --eval-review-corpus /path/to/journal_reviews_inbox_2026-06-04 --eval-limit 3 --eval-output outputs/review_eval_plan.json
 
 # Paid API mode for the same held-out eval, after reviewing the dry-run cost.
 python -m feedback_pipeline --eval-review-corpus /path/to/journal_reviews_inbox_2026-06-04 --eval-limit 1 --eval-run-api
+
+# Compare baseline, API-safe prior, and local raw-memory upper bound.
+# Dry-run mode estimates the three-way gate cost without calling the API.
+python -m feedback_pipeline \
+  --eval-review-prior-gate /path/to/journal_reviews_inbox_2026-06-04 \
+  --eval-limit 3 \
+  --eval-output outputs/review_prior_eval_gate_plan.json
+
+# Paid API mode for the gate, after reviewing the dry-run cost.
+python -m feedback_pipeline \
+  --eval-review-prior-gate /path/to/journal_reviews_inbox_2026-06-04 \
+  --eval-limit 1 \
+  --eval-output outputs/review_prior_eval_gate_api.json \
+  --eval-run-api
+
+# OpenAI Batch API mode for the gate. This writes local JSONL batch files and
+# a manifest, then polls each dependent batch stage until completion.
+python -m feedback_pipeline \
+  --eval-review-prior-gate /path/to/journal_reviews_inbox_2026-06-04 \
+  --eval-limit 3 \
+  --eval-output outputs/review_prior_eval_gate_batch.json \
+  --eval-run-api \
+  --eval-batch-api
 ```
 
 See [DESIGN.md](DESIGN.md) for implementation details.

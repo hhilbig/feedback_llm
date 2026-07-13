@@ -278,7 +278,7 @@ class MockedPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Triaging issues by editorial decision relevance...", progress)
         self.assertTrue(any("Scoring proposals" in msg for msg in progress))
         self.assertFalse(any("critique" in msg.lower() for msg in progress))
-        self.assertEqual(mock_score.call_args.kwargs["escalation_model"], "gpt-5.5")
+        self.assertEqual(mock_score.call_args.kwargs["escalation_model"], "gpt-5.6-sol")
         mock_verify.assert_awaited_once()
         mock_rewrite.assert_awaited_once()
         mock_triage.assert_awaited_once()

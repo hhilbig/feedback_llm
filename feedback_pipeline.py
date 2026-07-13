@@ -4,10 +4,14 @@ import json
 import os
 import re
 import sys
+import time
 from argparse import ArgumentParser
 from collections import Counter, defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Tuple
 
 # --- Smart API Key Loading ---
@@ -41,13 +45,35 @@ and can be refined later.
 
 
 MODEL_REGISTRY = {
-    # Current model family, verified against OpenAI docs on 2026-05-22.
-    "gpt-5.5": {
+    # Current model family, verified against OpenAI docs on 2026-07-13.
+    "gpt-5.6-sol": {
         "input": 5.00 / 1e6,
         "output": 30.00 / 1e6,
         "cached_input": 0.50 / 1e6,
         "label": "Frontier synthesis and escalation",
         "current": True,
+    },
+    "gpt-5.6-terra": {
+        "input": 2.50 / 1e6,
+        "output": 15.00 / 1e6,
+        "cached_input": 0.25 / 1e6,
+        "label": "Balanced default for substantive review stages",
+        "current": True,
+    },
+    "gpt-5.6-luna": {
+        "input": 1.00 / 1e6,
+        "output": 6.00 / 1e6,
+        "cached_input": 0.10 / 1e6,
+        "label": "Efficient model for simple structured tasks",
+        "current": True,
+    },
+    # Previous families remain allowed for reproducibility of older runs.
+    "gpt-5.5": {
+        "input": 5.00 / 1e6,
+        "output": 30.00 / 1e6,
+        "cached_input": 0.50 / 1e6,
+        "label": "Frontier synthesis and escalation",
+        "current": False,
     },
     "gpt-5.5-pro": {
         "input": 30.00 / 1e6,
@@ -55,30 +81,29 @@ MODEL_REGISTRY = {
         # Docs do not list cached-input pricing for pro; charge cached tokens at input price.
         "cached_input": 30.00 / 1e6,
         "label": "Highest-cost precision model",
-        "current": True,
+        "current": False,
     },
     "gpt-5.4": {
         "input": 2.50 / 1e6,
         "output": 15.00 / 1e6,
         "cached_input": 0.25 / 1e6,
         "label": "Affordable frontier model",
-        "current": True,
+        "current": False,
     },
     "gpt-5.4-mini": {
         "input": 0.75 / 1e6,
         "output": 4.50 / 1e6,
         "cached_input": 0.075 / 1e6,
         "label": "Routed default for high-volume reasoning",
-        "current": True,
+        "current": False,
     },
     "gpt-5.4-nano": {
         "input": 0.20 / 1e6,
         "output": 1.25 / 1e6,
         "cached_input": 0.02 / 1e6,
         "label": "Cheap routing model for simple structured tasks",
-        "current": True,
+        "current": False,
     },
-    # Previous GPT-5 models remain allowed for reproducibility of older runs.
     "gpt-5.2": {
         "input": 1.75 / 1e6,
         "output": 14.00 / 1e6,
@@ -125,14 +150,23 @@ MODEL_PRICING = {
     for name, spec in MODEL_REGISTRY.items()
 }
 
-GENERATION_MODEL = "gpt-5.4-mini"
-SCORING_MODEL = "gpt-5.4-mini"
-VERIFICATION_MODEL = "gpt-5.4-mini"
-REWRITE_MODEL = "gpt-5.4-nano"
-CLUSTER_LABEL_MODEL = "gpt-5.4-nano"
-META_MODEL = "gpt-5.5"
-ESCALATION_MODEL = "gpt-5.5"
-TRIAGE_MODEL = "gpt-5.5"
+GENERATION_MODEL = "gpt-5.6-terra"
+SCORING_MODEL = "gpt-5.6-terra"
+VERIFICATION_MODEL = "gpt-5.6-terra"
+REWRITE_MODEL = "gpt-5.6-luna"
+CLUSTER_LABEL_MODEL = "gpt-5.6-luna"
+META_MODEL = "gpt-5.6-sol"
+ESCALATION_MODEL = "gpt-5.6-sol"
+TRIAGE_MODEL = "gpt-5.6-sol"
+
+# Preserve the effective reasoning behavior of the replaced models. GPT-5.4
+# mini/nano defaulted to none; GPT-5.5 defaulted to medium. GPT-5.6 defaults to
+# medium across tiers, so Terra/Luna must be explicit to avoid a silent change.
+MODEL_REASONING_EFFORT = {
+    "gpt-5.6-sol": "medium",
+    "gpt-5.6-terra": "none",
+    "gpt-5.6-luna": "none",
+}
 
 
 @dataclass(frozen=True)
@@ -158,6 +192,43 @@ REVIEW_MEMORY_MIN_SIMILARITY = 0.06
 REVIEW_MEMORY_SOURCE_KIND = "review_digest"
 RAW_REVIEW_SOURCE_KIND = "raw_gmail_body"
 HUMAN_ISSUE_CLUSTER_SIMILARITY = 0.50
+REVIEW_PRIOR_MAX_NGRAM_OVERLAP = 7
+REVIEW_PRIOR_ALLOWED_SUPPORT_BUCKETS = {
+    "none",
+    "low",
+    "medium",
+    "high",
+    "some",
+    "unknown",
+}
+REVIEW_PRIOR_DECISION_TIERS = {
+    "potential_rejection",
+    "major_revision",
+    "minor_revision",
+    "nice_to_have",
+}
+REVIEW_PRIOR_USE_FLAGS = {
+    "generation_checklist",
+    "triage_calibration",
+    "style_rewrite",
+}
+REVIEW_PRIOR_REQUIRED_FIELDS = {
+    "prior_id",
+    "use_for",
+    "applies_when",
+    "reviewer_concern",
+    "raise_if_missing",
+    "demote_if_present",
+    "suppress_if",
+    "decision_tier_prior",
+    "reviewer_agreement",
+    "support",
+    "privacy_status",
+}
+_CHAT_JSON_SEMAPHORE: asyncio.Semaphore | None = None
+_CHAT_JSON_SEMAPHORE_LIMIT: int | None = None
+_CHAT_JSON_SEMAPHORE_LOOP: asyncio.AbstractEventLoop | None = None
+_ACTIVE_BATCH_CHAT_CLIENT: "OpenAIBatchChatClient | None" = None
 
 
 @dataclass(frozen=True)
@@ -365,6 +436,85 @@ def sanitize_historical_review_text(text: str, manuscript_title: str = "") -> st
     safe = LONG_HEX_RE.sub("[message id]", safe)
     safe = re.sub(r"`[^`]+`", "[redacted]", safe)
     return re.sub(r"\s+", " ", safe).strip()
+
+
+API_METADATA_SECTION_RE = re.compile(
+    r"(?im)^\s*(?:acknowledg(?:e)?ments?|funding|financial support|author note|"
+    r"conflict of interest|competing interests|ethics statement|data availability|"
+    r"replication files?|supplementary material|author biographies?)\b.*$"
+)
+API_SECTION_BOUNDARY_RE = re.compile(
+    r"(?im)^\s*(?:references|bibliography|appendix|appendices)\b.*$"
+)
+API_ABSTRACT_RE = re.compile(r"(?im)^\s*(?:abstract|summary)\s*[:.]?\s*$|^\s*abstract\s*[:.-]")
+API_INTRO_RE = re.compile(r"(?im)^\s*(?:1\.?\s+)?introduction\b")
+DOI_RE = re.compile(r"\b(?:doi:\s*)?10\.\d{4,9}/[-._;()/:A-Z0-9]+\b", re.I)
+ORCID_RE = re.compile(r"\b\d{4}-\d{4}-\d{4}-\d{3}[\dX]\b", re.I)
+LATEX_METADATA_COMMAND_RE = re.compile(
+    r"\\(?:title|author|date|thanks|affiliation|institute)\s*(?:\[[^\]]*\])?\s*\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}",
+    re.I | re.S,
+)
+
+
+def redact_identifying_info_for_api(paper_text: str) -> Dict[str, Any]:
+    """Remove obvious author/submission metadata before sending manuscripts to the API.
+
+    This is a privacy guardrail, not a formal anonymization guarantee: manuscript
+    content, research questions, and citations can still be recognizable.
+    """
+    original = paper_text or ""
+    safe = original.replace("\r\n", "\n").replace("\r", "\n")
+    redactions: Dict[str, int] = defaultdict(int)
+
+    safe, n = LATEX_METADATA_COMMAND_RE.subn("[title/author metadata redacted]", safe)
+    redactions["latex_title_author_commands"] += n
+
+    first_window = safe[:10000]
+    metadata_cut = API_ABSTRACT_RE.search(first_window)
+    if metadata_cut and metadata_cut.start() > 0:
+        safe = "[title page and author metadata redacted]\n\n" + safe[metadata_cut.start():]
+        redactions["title_page_blocks"] += 1
+    else:
+        intro_cut = API_INTRO_RE.search(first_window)
+        if intro_cut and intro_cut.start() > 1200:
+            safe = "[title page and author metadata redacted]\n\n" + safe[intro_cut.start():]
+            redactions["title_page_blocks"] += 1
+
+    for name_pattern in [
+        r"\bHanno\s+Hilbig\b",
+        r"\b(?:Professor|Prof\.?|Dr\.?)\s+Hilbig\b",
+        r"\bHanno\b",
+        r"\bHilbig\b",
+    ]:
+        safe, n = re.subn(name_pattern, "[author]", safe, flags=re.I)
+        redactions["author_name_mentions"] += n
+
+    safe, n = EMAIL_RE.subn("[email redacted]", safe)
+    redactions["emails"] += n
+    safe, n = URL_RE.subn("[url redacted]", safe)
+    redactions["urls"] += n
+    safe, n = DOI_RE.subn("[doi redacted]", safe)
+    redactions["dois"] += n
+    safe, n = ORCID_RE.subn("[orcid redacted]", safe)
+    redactions["orcids"] += n
+
+    pieces: List[str] = []
+    cursor = 0
+    for match in API_METADATA_SECTION_RE.finditer(safe):
+        pieces.append(safe[cursor:match.start()])
+        boundary = API_SECTION_BOUNDARY_RE.search(safe, match.end())
+        cursor = boundary.start() if boundary else len(safe)
+        pieces.append("\n[author/funding/data-availability metadata section redacted]\n")
+        redactions["metadata_sections"] += 1
+    pieces.append(safe[cursor:])
+    safe = "".join(pieces)
+
+    return {
+        "safe_text": re.sub(r"\n{4,}", "\n\n\n", safe).strip(),
+        "raw_chars": len(original),
+        "safe_chars": len(safe.strip()),
+        "redactions": dict(redactions),
+    }
 
 
 def _split_markdown_table_row(row: str) -> List[str]:
@@ -857,6 +1007,1169 @@ def build_review_memory_context(
         "Do not import facts from these examples into the current manuscript review.\n\n"
         + "\n\n".join(rows)
     )
+
+
+def review_prior_items(prior_artifact: Dict[str, Any] | List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return reviewer-prior entries from either a bare list or versioned artifact."""
+    if isinstance(prior_artifact, list):
+        return prior_artifact
+    priors = prior_artifact.get("priors", [])
+    return priors if isinstance(priors, list) else []
+
+
+def _iter_prior_text_fields(prior: Dict[str, Any]) -> List[str]:
+    text_parts: List[str] = []
+    for key in [
+        "prior_id",
+        "reviewer_concern",
+        "rejection_trigger",
+        "known_disagreement",
+    ]:
+        value = prior.get(key)
+        if isinstance(value, str):
+            text_parts.append(value)
+    for key in ["raise_if_missing", "demote_if_present", "suppress_if", "minimum_fix", "do_not_raise_when"]:
+        value = prior.get(key, [])
+        if isinstance(value, str):
+            text_parts.append(value)
+        elif isinstance(value, list):
+            text_parts.extend(str(item) for item in value if item is not None)
+    applies_when = prior.get("applies_when", {})
+    if isinstance(applies_when, dict):
+        for value in applies_when.values():
+            if isinstance(value, str):
+                text_parts.append(value)
+            elif isinstance(value, list):
+                text_parts.extend(str(item) for item in value if item is not None)
+    return text_parts
+
+
+def audit_review_prior_artifact(
+    prior_artifact: Dict[str, Any],
+    require_deployment_gate: bool = False,
+) -> Dict[str, Any]:
+    """Audit an API-facing reviewer-prior artifact for schema and privacy risks.
+
+    This is deliberately conservative. Exact counts and identifiable examples
+    can remain in local audit files, but not in the runtime API-safe prior.
+    """
+    errors: List[str] = []
+    warnings: List[str] = []
+    if not isinstance(prior_artifact, dict):
+        return {"passed": False, "errors": ["artifact must be a JSON object"], "warnings": []}
+
+    if not prior_artifact.get("artifact_version"):
+        warnings.append("missing artifact_version")
+    privacy_audit = prior_artifact.get("privacy_audit", {})
+    if not isinstance(privacy_audit, dict) or privacy_audit.get("passed") is not True:
+        errors.append("privacy_audit.passed must be true before API use")
+    overlap = privacy_audit.get("max_raw_review_ngram_overlap")
+    if isinstance(overlap, (int, float)) and overlap > REVIEW_PRIOR_MAX_NGRAM_OVERLAP:
+        errors.append(
+            "max_raw_review_ngram_overlap exceeds "
+            f"{REVIEW_PRIOR_MAX_NGRAM_OVERLAP}: {overlap}"
+        )
+    if privacy_audit.get("identifiable_setting_flags", 0):
+        errors.append("privacy audit reports identifiable setting flags")
+
+    priors = review_prior_items(prior_artifact)
+    if not priors:
+        errors.append("artifact contains no priors")
+
+    for idx, prior in enumerate(priors, start=1):
+        if not isinstance(prior, dict):
+            errors.append(f"prior {idx} is not an object")
+            continue
+        prior_id = prior.get("prior_id", f"prior_{idx}")
+        missing = sorted(REVIEW_PRIOR_REQUIRED_FIELDS - set(prior.keys()))
+        if missing:
+            errors.append(f"{prior_id}: missing required fields: {', '.join(missing)}")
+
+        use_for = prior.get("use_for", {})
+        if not isinstance(use_for, dict):
+            errors.append(f"{prior_id}: use_for must be an object")
+        else:
+            unknown_flags = sorted(set(use_for) - REVIEW_PRIOR_USE_FLAGS)
+            if unknown_flags:
+                warnings.append(f"{prior_id}: unknown use_for flags: {', '.join(unknown_flags)}")
+            for flag in REVIEW_PRIOR_USE_FLAGS:
+                if flag in use_for and not isinstance(use_for[flag], bool):
+                    errors.append(f"{prior_id}: use_for.{flag} must be boolean")
+
+        decision_prior = prior.get("decision_tier_prior", {})
+        if not isinstance(decision_prior, dict):
+            errors.append(f"{prior_id}: decision_tier_prior must be an object")
+        else:
+            missing_tiers = sorted(REVIEW_PRIOR_DECISION_TIERS - set(decision_prior))
+            if missing_tiers:
+                errors.append(f"{prior_id}: missing decision-tier priors: {', '.join(missing_tiers)}")
+            tier_sum = 0.0
+            for tier, value in decision_prior.items():
+                if tier not in REVIEW_PRIOR_DECISION_TIERS:
+                    warnings.append(f"{prior_id}: unknown decision tier: {tier}")
+                    continue
+                if not isinstance(value, (int, float)):
+                    errors.append(f"{prior_id}: decision_tier_prior.{tier} must be numeric")
+                    continue
+                tier_sum += float(value)
+            if tier_sum and abs(tier_sum - 1.0) > 0.05:
+                warnings.append(f"{prior_id}: decision-tier prior sums to {tier_sum:.3f}, not 1.0")
+
+        support = prior.get("support", {})
+        if not isinstance(support, dict):
+            errors.append(f"{prior_id}: support must be an object")
+        else:
+            for key, value in support.items():
+                if isinstance(value, (int, float)):
+                    errors.append(f"{prior_id}: support.{key} must be bucketed, not exact count")
+                elif isinstance(value, str) and value not in REVIEW_PRIOR_ALLOWED_SUPPORT_BUCKETS:
+                    warnings.append(f"{prior_id}: unusual support bucket for {key}: {value}")
+
+        if prior.get("privacy_status") != "safe_abstracted":
+            errors.append(f"{prior_id}: privacy_status must be safe_abstracted")
+
+        text_blob = "\n".join(_iter_prior_text_fields(prior))
+        if EMAIL_RE.search(text_blob):
+            errors.append(f"{prior_id}: contains email-like text")
+        if URL_RE.search(text_blob):
+            errors.append(f"{prior_id}: contains URL-like text")
+        if DOI_RE.search(text_blob):
+            errors.append(f"{prior_id}: contains DOI-like text")
+        if ORCID_RE.search(text_blob):
+            errors.append(f"{prior_id}: contains ORCID-like text")
+        if SUBMISSION_ID_RE.search(text_blob):
+            errors.append(f"{prior_id}: contains submission-id-like text")
+        if re.search(r"\bHanno\b|\bHilbig\b", text_blob, re.I):
+            errors.append(f"{prior_id}: contains author-identifying name")
+        if re.search(
+            r"\b(?:AJPS|APSR|BJPS|JOP|World Politics|Comparative Political Studies|CPS)\b",
+            text_blob,
+            re.I,
+        ):
+            errors.append(f"{prior_id}: contains journal-specific label")
+        if re.search(r"\b(?:19|20)\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b", text_blob):
+            errors.append(f"{prior_id}: contains date/year-like numeric fingerprint")
+        if re.search(r"\b(?:N|n|sample size)\s*[=:]\s*\d{3,}\b", text_blob):
+            errors.append(f"{prior_id}: contains exact sample-size-like numeric fingerprint")
+
+    if require_deployment_gate:
+        heldout_eval = prior_artifact.get("heldout_eval", {})
+        if not isinstance(heldout_eval, dict) or not heldout_eval:
+            errors.append("heldout_eval metadata is required for deployment")
+        else:
+            recall_delta = heldout_eval.get("major_issue_recall_at_8_delta")
+            if not isinstance(recall_delta, (int, float)) or recall_delta <= 0:
+                errors.append("deployment gate failed: major_issue_recall_at_8_delta must be positive")
+            unsupported_delta = heldout_eval.get("unsupported_claim_rate_delta")
+            if isinstance(unsupported_delta, (int, float)) and unsupported_delta > 0:
+                errors.append("deployment gate failed: unsupported_claim_rate_delta increased")
+            duplicate_delta = heldout_eval.get("duplicate_laundry_list_rate_delta")
+            if isinstance(duplicate_delta, (int, float)) and duplicate_delta > 0:
+                errors.append("deployment gate failed: duplicate/laundry-list rate increased")
+
+    return {"passed": not errors, "errors": errors, "warnings": warnings}
+
+
+def load_review_prior(
+    path: str | Path,
+    require_deployment_gate: bool = False,
+) -> Dict[str, Any]:
+    """Load and validate an API-safe reviewer-prior artifact."""
+    artifact = json.loads(Path(path).read_text(encoding="utf-8"))
+    audit = audit_review_prior_artifact(
+        artifact,
+        require_deployment_gate=require_deployment_gate,
+    )
+    if not audit["passed"]:
+        raise ValueError("Review prior failed audit: " + "; ".join(audit["errors"]))
+    artifact["runtime_audit"] = audit
+    return artifact
+
+
+REVIEW_PRIOR_CONDITION_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "already",
+    "be",
+    "by",
+    "clear",
+    "does",
+    "full",
+    "if",
+    "is",
+    "make",
+    "makes",
+    "missing",
+    "no",
+    "not",
+    "of",
+    "or",
+    "reported",
+    "shown",
+    "the",
+    "to",
+    "when",
+    "with",
+    "without",
+}
+
+
+def _review_prior_condition_tokens(condition: str) -> set[str]:
+    tokens = re.findall(r"[a-z0-9]+", condition.lower().replace("-", " "))
+    return {
+        token
+        for token in tokens
+        if len(token) > 2 and token not in REVIEW_PRIOR_CONDITION_STOPWORDS
+    }
+
+
+def _review_prior_profile_values(evidence_map: Dict[str, Any]) -> Dict[str, set[str]]:
+    profile = evidence_map.get("substantive_profile", {}) or {}
+    extracted = evidence_map.get("extracted", {}) or {}
+    design = extracted.get("research_design", {})
+    designs = set(profile.get("designs", []) if isinstance(profile.get("designs"), list) else [])
+    if isinstance(design, dict) and design.get("design_type"):
+        designs.add(str(design["design_type"]))
+    data_types = set(profile.get("data_types", []) if isinstance(profile.get("data_types"), list) else [])
+    key_risks = set(profile.get("key_risks", []) if isinstance(profile.get("key_risks"), list) else [])
+    causal_designs = {
+        "difference_in_differences",
+        "triple_difference",
+        "event_study",
+        "instrumental_variables",
+        "regression_discontinuity",
+        "experiment",
+    }
+    claim_types = {"causal"} if designs & causal_designs else {"descriptive"} if "descriptive" in designs else set()
+    return {
+        "design": designs,
+        "data_structure": data_types | designs,
+        "data_type": data_types,
+        "key_risk": key_risks,
+        "claim_type": claim_types,
+    }
+
+
+def review_prior_applies_to_evidence(
+    prior: Dict[str, Any],
+    evidence_map: Dict[str, Any],
+) -> bool:
+    """Return whether a structured reviewer prior applies to the current paper profile."""
+    applies_when = prior.get("applies_when", {})
+    if not isinstance(applies_when, dict) or not applies_when:
+        return True
+    profile_values = _review_prior_profile_values(evidence_map)
+    for key, expected in applies_when.items():
+        expected_values = {expected} if isinstance(expected, str) else set(expected or [])
+        if not expected_values:
+            continue
+        observed = profile_values.get(key, set())
+        if observed and observed.isdisjoint(expected_values):
+            return False
+        if not observed and key in {"design", "claim_type"}:
+            return False
+    return True
+
+
+def _review_prior_evidence_blob(evidence_map: Dict[str, Any]) -> str:
+    return "\n".join(
+        [
+            evidence_map.get("safe_text", ""),
+            json.dumps(evidence_map.get("extracted", {}), ensure_ascii=False),
+        ]
+    )
+
+
+def review_prior_condition_satisfied(condition: str, evidence_map: Dict[str, Any]) -> bool:
+    """Heuristically check whether a prior condition is already satisfied by the paper."""
+    lowered = condition.lower()
+    profile_values = _review_prior_profile_values(evidence_map)
+    designs = profile_values.get("design", set())
+    claim_types = profile_values.get("claim_type", set())
+    if "descriptive" in lowered and ("descriptive" in designs or "descriptive" in claim_types):
+        return True
+    if "does not make" in lowered and "causal" in lowered:
+        return "causal" not in claim_types
+    if "causal" in lowered and "claim" in lowered:
+        return "causal" in claim_types
+
+    condition_tokens = _review_prior_condition_tokens(condition)
+    if not condition_tokens:
+        return False
+    evidence_tokens = _token_set(_review_prior_evidence_blob(evidence_map))
+    shared = condition_tokens & evidence_tokens
+    minimum_shared = 1 if len(condition_tokens) <= 2 else 2
+    return len(shared) >= minimum_shared and len(shared) / len(condition_tokens) >= 0.6
+
+
+def _existing_issue_text(existing_issues: List[Dict[str, Any]] | None) -> str:
+    if not existing_issues:
+        return ""
+    fields = []
+    for issue in existing_issues:
+        fields.extend(
+            str(issue.get(key, ""))
+            for key in ["text", "issue_family", "dimension", "diagnostic_next_steps"]
+        )
+    return "\n".join(fields)
+
+
+def review_prior_covered_by_existing_issues(
+    prior: Dict[str, Any],
+    existing_issues: List[Dict[str, Any]] | None,
+) -> bool:
+    """Return whether a cold-pass issue already appears to cover this prior."""
+    existing_text = _existing_issue_text(existing_issues)
+    if not existing_text.strip():
+        return False
+    concern = prior.get("reviewer_concern", "")
+    if concern and lexical_similarity(concern, existing_text) >= 0.08:
+        return True
+    prior_tokens = _token_set(
+        " ".join(
+            [
+                str(prior.get("prior_id", "")).replace("_", " "),
+                concern,
+                " ".join(str(item) for item in prior.get("raise_if_missing", [])),
+            ]
+        )
+    )
+    existing_tokens = _token_set(existing_text)
+    return len(prior_tokens & existing_tokens) >= 3
+
+
+def assess_review_prior_for_evidence(
+    prior: Dict[str, Any],
+    evidence_map: Dict[str, Any],
+    existing_issues: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    """Assess applicability, suppression, demotion, and missing checks for one prior."""
+    applicable = review_prior_applies_to_evidence(prior, evidence_map)
+    suppress_if = prior.get("suppress_if", []) or []
+    raise_if_missing = prior.get("raise_if_missing", []) or []
+    demote_if_present = prior.get("demote_if_present", []) or []
+    suppressed_by = [
+        condition
+        for condition in suppress_if
+        if review_prior_condition_satisfied(str(condition), evidence_map)
+    ]
+    demoted_by = [
+        condition
+        for condition in demote_if_present
+        if review_prior_condition_satisfied(str(condition), evidence_map)
+    ]
+    missing_checks = [
+        condition
+        for condition in raise_if_missing
+        if not review_prior_condition_satisfied(str(condition), evidence_map)
+    ]
+    covered_by_cold_pass = review_prior_covered_by_existing_issues(prior, existing_issues)
+    status = "not_applicable"
+    if applicable:
+        if suppressed_by:
+            status = "suppressed"
+        elif covered_by_cold_pass:
+            status = "covered_by_cold_pass"
+        elif missing_checks:
+            status = "gap"
+        elif demoted_by:
+            status = "demoted"
+        else:
+            status = "satisfied"
+    return {
+        "prior_id": prior.get("prior_id", ""),
+        "status": status,
+        "applicable": applicable,
+        "suppressed_by": suppressed_by,
+        "demoted_by": demoted_by,
+        "missing_checks": missing_checks,
+        "covered_by_cold_pass": covered_by_cold_pass,
+        "prior": prior,
+    }
+
+
+def _review_prior_decision_weight(prior: Dict[str, Any]) -> float:
+    weights = {
+        "potential_rejection": 1.0,
+        "major_revision": 0.75,
+        "minor_revision": 0.35,
+        "nice_to_have": 0.05,
+    }
+    decision_prior = prior.get("decision_tier_prior", {}) or {}
+    return sum(float(decision_prior.get(tier, 0.0) or 0.0) * weight for tier, weight in weights.items())
+
+
+def select_review_prior_gaps(
+    evidence_map: Dict[str, Any],
+    prior_artifact: Dict[str, Any],
+    existing_issues: List[Dict[str, Any]] | None = None,
+    use_for: str = "generation_checklist",
+    top_k: int = 5,
+) -> List[Dict[str, Any]]:
+    """Select applicable, unsatisfied reviewer-prior checks after a cold pass."""
+    gaps = []
+    for prior in review_prior_items(prior_artifact):
+        use_flags = prior.get("use_for", {}) or {}
+        if use_for and not use_flags.get(use_for, False):
+            continue
+        assessment = assess_review_prior_for_evidence(
+            prior,
+            evidence_map,
+            existing_issues=existing_issues,
+        )
+        if assessment["status"] == "gap":
+            assessment["decision_weight"] = round(_review_prior_decision_weight(prior), 4)
+            gaps.append(assessment)
+    gaps.sort(
+        key=lambda item: (
+            item["decision_weight"],
+            item["prior"].get("reviewer_agreement") == "high",
+            len(item.get("missing_checks", [])),
+        ),
+        reverse=True,
+    )
+    return gaps[:top_k]
+
+
+def build_review_prior_gap_context(
+    evidence_map: Dict[str, Any],
+    prior_artifact: Dict[str, Any],
+    existing_issues: List[Dict[str, Any]] | None = None,
+    top_k: int = 5,
+) -> str:
+    """Build a safe prompt block for targeted prior-guided gap generation."""
+    gaps = select_review_prior_gaps(
+        evidence_map,
+        prior_artifact,
+        existing_issues=existing_issues,
+        use_for="generation_checklist",
+        top_k=top_k,
+    )
+    if not gaps:
+        return ""
+    rows = []
+    for idx, gap in enumerate(gaps, start=1):
+        prior = gap["prior"]
+        support = prior.get("support", {})
+        decision_prior = prior.get("decision_tier_prior", {})
+        rows.append(
+            "\n".join(
+                [
+                    f"Prior gap {idx}: {prior.get('prior_id')}",
+                    f"- reviewer_concern: {prior.get('reviewer_concern')}",
+                    f"- missing_checks_to_inspect: {json.dumps(gap.get('missing_checks', []), ensure_ascii=False)}",
+                    f"- rejection_trigger: {prior.get('rejection_trigger', '')}",
+                    f"- minimum_fix: {json.dumps(prior.get('minimum_fix', []), ensure_ascii=False)}",
+                    f"- demote_if_present: {json.dumps(prior.get('demote_if_present', []), ensure_ascii=False)}",
+                    f"- suppress_if: {json.dumps(prior.get('suppress_if', []), ensure_ascii=False)}",
+                    f"- decision_tier_prior: {json.dumps(decision_prior, ensure_ascii=False)}",
+                    f"- reviewer_agreement: {prior.get('reviewer_agreement', 'unknown')}",
+                    f"- known_disagreement: {prior.get('known_disagreement', '')}",
+                    f"- support_buckets: {json.dumps(support, ensure_ascii=False)}",
+                ]
+            )
+        )
+    return (
+        "Structured reviewer-prior gap checks. Use these only to decide what high-salience "
+        "reviewer concerns to inspect next. The prior may raise checks, rank salience, "
+        "or shape wording, but it may not supply facts. Only manuscript evidence IDs can "
+        "support a critique, and already-addressed or suppressed checks should be demoted.\n\n"
+        + "\n\n".join(rows)
+    )
+
+
+def select_review_prior_calibration(
+    evidence_map: Dict[str, Any],
+    prior_artifact: Dict[str, Any],
+    use_for: str = "triage_calibration",
+    top_k: int = 8,
+) -> List[Dict[str, Any]]:
+    """Select applicable structured priors for triage or style calibration."""
+    selected = []
+    for prior in review_prior_items(prior_artifact):
+        use_flags = prior.get("use_for", {}) or {}
+        if use_for and not use_flags.get(use_for, False):
+            continue
+        assessment = assess_review_prior_for_evidence(prior, evidence_map)
+        if assessment["status"] in {"not_applicable", "suppressed"}:
+            continue
+        assessment["decision_weight"] = round(_review_prior_decision_weight(prior), 4)
+        selected.append(assessment)
+    selected.sort(
+        key=lambda item: (
+            item["decision_weight"],
+            item["prior"].get("reviewer_agreement") == "high",
+        ),
+        reverse=True,
+    )
+    return selected[:top_k]
+
+
+def build_review_prior_triage_context(
+    evidence_map: Dict[str, Any],
+    prior_artifact: Dict[str, Any],
+    top_k: int = 8,
+) -> str:
+    """Build a safe structured-prior block for decision-tier calibration."""
+    selected = select_review_prior_calibration(
+        evidence_map,
+        prior_artifact,
+        use_for="triage_calibration",
+        top_k=top_k,
+    )
+    if not selected:
+        return ""
+    rows = []
+    for idx, item in enumerate(selected, start=1):
+        prior = item["prior"]
+        rows.append(
+            "\n".join(
+                [
+                    f"Prior {idx}: {prior.get('prior_id')}",
+                    f"- reviewer_concern: {prior.get('reviewer_concern')}",
+                    f"- decision_tier_prior: {json.dumps(prior.get('decision_tier_prior', {}), ensure_ascii=False)}",
+                    f"- reviewer_agreement: {prior.get('reviewer_agreement', 'unknown')}",
+                    f"- rejection_trigger: {prior.get('rejection_trigger', '')}",
+                    f"- demote_if_present: {json.dumps(prior.get('demote_if_present', []), ensure_ascii=False)}",
+                    f"- suppress_if: {json.dumps(prior.get('suppress_if', []), ensure_ascii=False)}",
+                    f"- current_prior_status: {item.get('status')}",
+                    f"- support_buckets: {json.dumps(prior.get('support', {}), ensure_ascii=False)}",
+                ]
+            )
+        )
+    return (
+        "Structured reviewer priors for triage calibration only. These priors encode what "
+        "reviewers often treat as consequential, with bucketed support. They may affect "
+        "reviewer likelihood, decision tier, and wording, but they may not create factual "
+        "claims or override manuscript-only verification.\n\n"
+        + "\n\n".join(rows)
+    )
+
+
+def _support_bucket(count: int, medium_threshold: int = 3, high_threshold: int = 8) -> str:
+    if count <= 0:
+        return "none"
+    if count < medium_threshold:
+        return "low"
+    if count < high_threshold:
+        return "medium"
+    return "high"
+
+
+def _editor_signal_bucket(count: int) -> str:
+    if count <= 0:
+        return "none"
+    if count < 3:
+        return "some"
+    return "high"
+
+
+def _decision_tier_key(decision_tier: str) -> str:
+    if decision_tier == "potential_rejection_reason":
+        return "potential_rejection"
+    if decision_tier == "major_revision_issue":
+        return "major_revision"
+    if decision_tier == "minor_revision_issue":
+        return "minor_revision"
+    return "nice_to_have"
+
+
+def _coarsen_probability(value: float) -> float:
+    return round(round(value / 0.05) * 0.05, 2)
+
+
+def _decision_tier_prior_from_counts(counts: Counter[str]) -> Dict[str, float]:
+    tiers = ["potential_rejection", "major_revision", "minor_revision", "nice_to_have"]
+    smoothed = {tier: 0.25 for tier in tiers}
+    for tier, count in counts.items():
+        smoothed[_decision_tier_key(tier)] += count
+    total = sum(smoothed.values())
+    prior = {tier: _coarsen_probability(smoothed[tier] / total) for tier in tiers}
+    delta = round(1.0 - sum(prior.values()), 2)
+    prior["nice_to_have"] = round(max(0.0, prior["nice_to_have"] + delta), 2)
+    return prior
+
+
+def _dominant_issue_value(issues: List[Dict[str, Any]], key: str, default: str = "unclear") -> str:
+    counts = Counter(str(issue.get(key) or default) for issue in issues)
+    if not counts:
+        return default
+    return sorted(counts.items(), key=lambda item: (-item[1], item[0]))[0][0]
+
+
+def _prior_group_key(cluster: Dict[str, Any], members: List[Dict[str, Any]]) -> Tuple[str, str, str]:
+    design_type = _dominant_issue_value(members, "design_type", "unclear")
+    issue_type = str(cluster.get("issue_type") or _dominant_issue_value(members, "issue_type", "other"))
+    paper_section = str(cluster.get("paper_section") or _dominant_issue_value(members, "paper_section", "unspecified"))
+    return design_type, issue_type, paper_section
+
+
+def _safe_prior_id(design_type: str, issue_type: str, paper_section: str) -> str:
+    parts = [
+        part
+        for part in [design_type, issue_type, paper_section]
+        if part and part not in {"unclear", "unspecified", "other"}
+    ]
+    return _slugify_id("_".join(parts) or "general_reviewer_prior")[:80]
+
+
+def _claim_type_for_design(design_type: str) -> List[str]:
+    causal_designs = {
+        "difference_in_differences",
+        "triple_difference",
+        "event_study",
+        "instrumental_variables",
+        "regression_discontinuity",
+        "experiment",
+        "panel_observational",
+    }
+    return ["causal"] if design_type in causal_designs else []
+
+
+def _review_prior_use_for(issue_type: str) -> Dict[str, bool]:
+    return {
+        "generation_checklist": issue_type in {
+            "identification",
+            "measurement",
+            "interpretation",
+            "theory",
+            "robustness",
+        },
+        "triage_calibration": True,
+        "style_rewrite": issue_type in {"presentation"},
+    }
+
+
+def _reviewer_concern_template(issue_type: str, design_type: str, paper_section: str) -> str:
+    design_label = design_type.replace("_", " ") if design_type != "unclear" else "the manuscript"
+    templates = {
+        "identification": (
+            "Reviewers scrutinize whether the identification strategy is explicit, credible, "
+            f"and backed by diagnostics appropriate for {design_label}."
+        ),
+        "measurement": (
+            "Reviewers scrutinize whether measures, samples, coding choices, and data exclusions "
+            "are valid enough for the paper's central claim."
+        ),
+        "interpretation": (
+            "Reviewers scrutinize whether the interpretation follows from the evidence and whether "
+            "alternative explanations or scope conditions are handled explicitly."
+        ),
+        "theory": (
+            "Reviewers scrutinize whether the contribution, mechanism, and positioning in the "
+            "literature are clear enough to justify the paper's claims."
+        ),
+        "robustness": (
+            "Reviewers scrutinize whether the main result is robust to plausible alternative "
+            "specifications, samples, diagnostics, or placebo checks."
+        ),
+        "presentation": (
+            "Reviewers scrutinize whether presentation choices make the central claim, design, and "
+            "evidence easy to evaluate."
+        ),
+    }
+    return templates.get(
+        issue_type,
+        f"Reviewers scrutinize whether the {paper_section.replace('_', ' ')} discussion gives enough information to evaluate the paper.",
+    )
+
+
+def _raise_if_missing_template(issue_type: str, design_type: str) -> List[str]:
+    if issue_type == "identification":
+        if design_type in {"difference_in_differences", "triple_difference", "event_study"}:
+            return [
+                "no full pre-treatment lead table",
+                "no raw trend evidence",
+                "no inference-level justification",
+            ]
+        if design_type == "instrumental_variables":
+            return [
+                "no first-stage strength evidence",
+                "no exclusion restriction discussion",
+                "no sensitivity to alternative instruments",
+            ]
+        if design_type == "regression_discontinuity":
+            return [
+                "no manipulation or sorting diagnostic",
+                "no bandwidth sensitivity",
+                "no covariate balance evidence around the cutoff",
+            ]
+        return [
+            "identification assumptions are not stated",
+            "no design-specific falsification or placebo evidence",
+        ]
+    if issue_type == "measurement":
+        return [
+            "measure construction is not transparent",
+            "no validation or reliability evidence",
+            "sample construction or missingness is unclear",
+        ]
+    if issue_type == "interpretation":
+        return [
+            "alternative explanations are not addressed",
+            "scope conditions are unclear",
+            "claims extend beyond the presented evidence",
+        ]
+    if issue_type == "theory":
+        return [
+            "contribution relative to prior literature is unclear",
+            "mechanism is underdeveloped",
+            "theoretical scope conditions are not specified",
+        ]
+    if issue_type == "robustness":
+        return [
+            "no robustness or sensitivity checks for the main result",
+            "no placebo or falsification check where the design would call for one",
+        ]
+    if issue_type == "presentation":
+        return [
+            "core design or results are hard to locate",
+            "figures or tables do not make uncertainty and comparisons clear",
+        ]
+    return ["reviewer-relevant information is missing or ambiguous"]
+
+
+def _demote_if_present_template(issue_type: str, design_type: str) -> List[str]:
+    if issue_type == "identification" and design_type in {"difference_in_differences", "triple_difference", "event_study"}:
+        return [
+            "full lead table reported",
+            "raw group trends shown",
+            "joint pre-trend test reported",
+            "inference level is justified",
+        ]
+    if issue_type == "measurement":
+        return [
+            "validation evidence is reported",
+            "sample exclusions are transparent",
+            "missingness and weights are addressed",
+        ]
+    if issue_type == "theory":
+        return [
+            "contribution is explicitly differentiated from prior work",
+            "mechanism and scope conditions are stated",
+        ]
+    if issue_type == "robustness":
+        return [
+            "robustness checks directly address the main identifying concern",
+            "placebo or sensitivity checks are reported",
+        ]
+    return ["the manuscript already directly addresses the check"]
+
+
+def _suppress_if_template(issue_type: str, design_type: str) -> List[str]:
+    suppress = []
+    if issue_type == "identification":
+        suppress.extend([
+            "claim is descriptive",
+            "design does not make a causal claim",
+        ])
+    if design_type == "unclear":
+        suppress.append("design type is not applicable")
+    return suppress
+
+
+def _minimum_fix_template(issue_type: str, design_type: str) -> List[str]:
+    fixes = {
+        "identification": [
+            "state the identifying assumption",
+            "show design-specific diagnostics",
+            "explain what would falsify the design",
+        ],
+        "measurement": [
+            "document measure construction",
+            "report validation or reliability evidence",
+            "clarify sample construction and exclusions",
+        ],
+        "interpretation": [
+            "align claims with the evidence",
+            "address the strongest alternative explanation",
+            "state scope conditions",
+        ],
+        "theory": [
+            "state the contribution relative to prior work",
+            "clarify the mechanism",
+            "specify scope conditions",
+        ],
+        "robustness": [
+            "add sensitivity checks for the preferred specification",
+            "report placebo or falsification evidence where appropriate",
+        ],
+        "presentation": [
+            "make the core claim and evidence easier to locate",
+            "clarify figures, tables, or terminology",
+        ],
+    }
+    return fixes.get(issue_type, ["clarify the reviewer-relevant gap"])
+
+
+def _rejection_trigger_template(issue_type: str, design_type: str) -> str:
+    if issue_type == "identification":
+        return "Becomes rejection-relevant if the missing diagnostic undermines the credibility of the central causal claim."
+    if issue_type == "measurement":
+        return "Becomes rejection-relevant if measure or sample problems could generate the main result."
+    if issue_type == "theory":
+        return "Becomes rejection-relevant if the paper cannot show a clear contribution or mechanism."
+    if issue_type == "interpretation":
+        return "Becomes rejection-relevant if the central claim overstates what the evidence can support."
+    if issue_type == "robustness":
+        return "Becomes rejection-relevant if reasonable alternative specifications overturn the main result."
+    return "Becomes major if it prevents readers from evaluating the central claim."
+
+
+def _known_disagreement_template(issue_type: str) -> str:
+    if issue_type in {"identification", "measurement", "robustness"}:
+        return (
+            "Reviewer agreement depends on whether the manuscript already provides direct diagnostics "
+            "or robustness checks that address the concern."
+        )
+    if issue_type in {"theory", "interpretation"}:
+        return (
+            "Reviewer agreement depends on how central the claim is to the paper's contribution and "
+            "whether the manuscript clearly narrows its scope."
+        )
+    return "Reviewer agreement is likely lower when the issue is mainly stylistic or presentational."
+
+
+def _reviewer_agreement_bucket(
+    n_papers: int,
+    n_comments: int,
+    n_reviewers: int,
+    n_editor_mentions: int,
+) -> str:
+    if n_papers >= 3 and (n_reviewers >= 4 or n_editor_mentions >= 2):
+        return "high"
+    if n_papers >= 2 or n_comments >= 3 or n_editor_mentions >= 1:
+        return "medium"
+    return "low"
+
+
+def _source_review_text_for_privacy(corpus: Dict[str, Any]) -> str:
+    parts = []
+    for record in corpus.get("records", []):
+        parts.append(record.get("raw_text", ""))
+        parts.append(record.get("manuscript", ""))
+    for issue in corpus.get("issues", []):
+        parts.append(issue.get("issue_text", ""))
+        parts.append(issue.get("action_requested", ""))
+    return "\n".join(part for part in parts if part)
+
+
+def _privacy_tokens(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", (text or "").lower())
+
+
+def _longest_shared_ngram(left: str, right: str, max_n: int = 20) -> int:
+    left_tokens = _privacy_tokens(left)
+    right_text = " ".join(_privacy_tokens(right))
+    if not left_tokens or not right_text:
+        return 0
+    for n in range(min(max_n, len(left_tokens)), 2, -1):
+        for idx in range(0, len(left_tokens) - n + 1):
+            if " ".join(left_tokens[idx : idx + n]) in right_text:
+                return n
+    return 0
+
+
+def _compute_review_prior_privacy_audit(
+    artifact: Dict[str, Any],
+    source_text: str,
+) -> Dict[str, Any]:
+    max_overlap = 0
+    identifiable_flags = 0
+    field_checks = []
+    for prior in review_prior_items(artifact):
+        text_blob = "\n".join(_iter_prior_text_fields(prior))
+        overlap = _longest_shared_ngram(text_blob, source_text)
+        max_overlap = max(max_overlap, overlap)
+        flags = []
+        patterns = {
+            "email": EMAIL_RE,
+            "url": URL_RE,
+            "doi": DOI_RE,
+            "orcid": ORCID_RE,
+            "submission_id": SUBMISSION_ID_RE,
+            "author_name": re.compile(r"\bHanno\b|\bHilbig\b", re.I),
+            "journal_label": re.compile(
+                r"\b(?:AJPS|APSR|BJPS|JOP|World Politics|Comparative Political Studies|CPS)\b",
+                re.I,
+            ),
+            "year_or_date": re.compile(r"\b(?:19|20)\d{2}\b|\b\d{1,2}/\d{1,2}/\d{2,4}\b"),
+            "sample_size": re.compile(r"\b(?:N|n|sample size)\s*[=:]\s*\d{3,}\b"),
+        }
+        for label, pattern in patterns.items():
+            if pattern.search(text_blob):
+                flags.append(label)
+        identifiable_flags += len(flags)
+        field_checks.append(
+            {
+                "prior_id": prior.get("prior_id", ""),
+                "max_raw_review_ngram_overlap": overlap,
+                "flags": flags,
+            }
+        )
+    passed = max_overlap <= REVIEW_PRIOR_MAX_NGRAM_OVERLAP and identifiable_flags == 0
+    return {
+        "passed": passed,
+        "max_raw_review_ngram_overlap": max_overlap,
+        "identifiable_setting_flags": identifiable_flags,
+        "field_checks": field_checks,
+    }
+
+
+def _build_distilled_prior(
+    prior_id: str,
+    design_type: str,
+    issue_type: str,
+    paper_section: str,
+    members: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    decision_counts = Counter(issue.get("decision_tier", "") for issue in members)
+    n_papers = len({issue.get("paper_id", "") for issue in members if issue.get("paper_id")})
+    n_comments = len(members)
+    n_reviewers = len({issue.get("reviewer_id", "") for issue in members if issue.get("reviewer_id")})
+    n_editor_mentions = sum(
+        1
+        for issue in members
+        if re.search(r"\b(editor|associate editor)\b", issue.get("reviewer_id", ""), re.I)
+    )
+    applies_when: Dict[str, List[str]] = {}
+    if design_type != "unclear":
+        applies_when["design"] = [design_type]
+    claim_type = _claim_type_for_design(design_type)
+    if claim_type:
+        applies_when["claim_type"] = claim_type
+    if paper_section not in {"", "unspecified"}:
+        applies_when["paper_section"] = [paper_section]
+    return {
+        "prior_id": prior_id,
+        "use_for": _review_prior_use_for(issue_type),
+        "applies_when": applies_when,
+        "reviewer_concern": _reviewer_concern_template(issue_type, design_type, paper_section),
+        "raise_if_missing": _raise_if_missing_template(issue_type, design_type),
+        "demote_if_present": _demote_if_present_template(issue_type, design_type),
+        "suppress_if": _suppress_if_template(issue_type, design_type),
+        "decision_tier_prior": _decision_tier_prior_from_counts(decision_counts),
+        "rejection_trigger": _rejection_trigger_template(issue_type, design_type),
+        "minimum_fix": _minimum_fix_template(issue_type, design_type),
+        "reviewer_agreement": _reviewer_agreement_bucket(
+            n_papers,
+            n_comments,
+            n_reviewers,
+            n_editor_mentions,
+        ),
+        "known_disagreement": _known_disagreement_template(issue_type),
+        "support": {
+            "paper_support": _support_bucket(n_papers),
+            "comment_support": _support_bucket(n_comments),
+            "editor_signal": _editor_signal_bucket(n_editor_mentions),
+        },
+        "privacy_status": "safe_abstracted",
+    }
+
+
+def distill_review_prior_from_corpus(
+    corpus: Dict[str, Any],
+    min_support_papers: int = 3,
+    min_support_comments: int = 3,
+    artifact_version: str | None = None,
+) -> Dict[str, Any]:
+    """Distill private review issues into an API-safe structured prior artifact.
+
+    The returned API artifact contains only bucketed support and controlled
+    reviewer-prior language. Exact paper/comment/reviewer counts stay in
+    `local_audit`, which should remain local and out of git when built from real
+    private reviews.
+    """
+    targets, excluded_targets = filter_human_review_target_issues(corpus.get("issues", []))
+    clusters = cluster_human_review_issues(targets)
+    issues_by_id = {_human_issue_identifier(issue): issue for issue in targets}
+    grouped_members: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = defaultdict(list)
+    grouped_clusters: Dict[Tuple[str, str, str], List[str]] = defaultdict(list)
+    excluded_clusters: List[Dict[str, Any]] = []
+
+    for cluster in clusters:
+        members = [
+            issues_by_id[issue_id]
+            for issue_id in cluster.get("issue_ids", [])
+            if issue_id in issues_by_id
+        ]
+        if not members:
+            continue
+        key = _prior_group_key(cluster, members)
+        grouped_members[key].extend(members)
+        grouped_clusters[key].append(cluster.get("cluster_id", ""))
+
+    priors = []
+    prior_support = []
+    used_prior_ids: Counter[str] = Counter()
+    for key, members in sorted(grouped_members.items()):
+        design_type, issue_type, paper_section = key
+        n_papers = len({issue.get("paper_id", "") for issue in members if issue.get("paper_id")})
+        n_comments = len(members)
+        n_editor_mentions = sum(
+            1
+            for issue in members
+            if re.search(r"\b(editor|associate editor)\b", issue.get("reviewer_id", ""), re.I)
+        )
+        base_prior_id = _safe_prior_id(design_type, issue_type, paper_section)
+        used_prior_ids[base_prior_id] += 1
+        prior_id = (
+            base_prior_id
+            if used_prior_ids[base_prior_id] == 1
+            else f"{base_prior_id}_{used_prior_ids[base_prior_id]}"
+        )
+        if issue_type == "other":
+            excluded_clusters.append(
+                {
+                    "prior_id": prior_id,
+                    "cluster_ids": grouped_clusters[key],
+                    "reason": "unsupported_issue_type_for_api_prior",
+                    "n_papers": n_papers,
+                    "n_review_comments": n_comments,
+                }
+            )
+            continue
+        if n_papers < min_support_papers and n_comments < min_support_comments:
+            excluded_clusters.append(
+                {
+                    "prior_id": prior_id,
+                    "cluster_ids": grouped_clusters[key],
+                    "reason": "below_minimum_support",
+                    "n_papers": n_papers,
+                    "n_review_comments": n_comments,
+                }
+            )
+            continue
+        prior = _build_distilled_prior(
+            prior_id,
+            design_type,
+            issue_type,
+            paper_section,
+            members,
+        )
+        priors.append(prior)
+        prior_support.append(
+            {
+                "prior_id": prior_id,
+                "cluster_ids": grouped_clusters[key],
+                "n_papers": n_papers,
+                "n_review_comments": n_comments,
+                "n_reviewers": len({issue.get("reviewer_id", "") for issue in members if issue.get("reviewer_id")}),
+                "n_editor_mentions": n_editor_mentions,
+                "decision_tier_counts": dict(Counter(issue.get("decision_tier", "") for issue in members)),
+                "issue_ids": [_human_issue_identifier(issue) for issue in members],
+                "review_files": sorted({issue.get("review_file", "") for issue in members if issue.get("review_file")}),
+            }
+        )
+
+    artifact = {
+        "artifact_version": artifact_version or f"{date.today().isoformat()}_v1",
+        "source_summary": {
+            "paper_support": _support_bucket(corpus.get("stats", {}).get("records_with_papers", 0)),
+            "review_support": _support_bucket(corpus.get("stats", {}).get("records", 0)),
+            "atomic_issue_support": _support_bucket(len(targets), medium_threshold=10, high_threshold=50),
+            "prior_count": len(priors),
+        },
+        "priors": priors,
+        "privacy_audit": {
+            "passed": False,
+            "max_raw_review_ngram_overlap": 0,
+            "identifiable_setting_flags": 0,
+        },
+    }
+    privacy_audit = _compute_review_prior_privacy_audit(
+        artifact,
+        _source_review_text_for_privacy(corpus),
+    )
+    artifact["privacy_audit"] = privacy_audit
+    runtime_audit = audit_review_prior_artifact(artifact)
+
+    local_audit = {
+        "artifact_version": artifact["artifact_version"],
+        "source_summary_exact": {
+            "n_records": corpus.get("stats", {}).get("records", 0),
+            "n_records_with_papers": corpus.get("stats", {}).get("records_with_papers", 0),
+            "n_raw_review_records": corpus.get("stats", {}).get("raw_review_records", 0),
+            "n_atomic_issues": corpus.get("stats", {}).get("issues", 0),
+            "n_target_issues": len(targets),
+            "n_excluded_target_issues": len(excluded_targets),
+            "n_human_issue_clusters": len(clusters),
+            "n_distilled_priors": len(priors),
+        },
+        "minimum_support": {
+            "min_support_papers": min_support_papers,
+            "min_support_comments": min_support_comments,
+        },
+        "prior_support_exact": prior_support,
+        "excluded_target_issues": excluded_targets,
+        "excluded_clusters": excluded_clusters,
+        "privacy_audit": privacy_audit,
+        "runtime_audit": runtime_audit,
+    }
+    return {
+        "artifact": artifact,
+        "local_audit": local_audit,
+        "summary": {
+            "priors": len(priors),
+            "target_issues": len(targets),
+            "human_issue_clusters": len(clusters),
+            "excluded_clusters": len(excluded_clusters),
+            "privacy_passed": privacy_audit["passed"],
+            "runtime_audit_passed": runtime_audit["passed"],
+        },
+    }
+
+
+def write_review_prior_distillation(
+    result: Dict[str, Any],
+    artifact_output: str | Path,
+    audit_output: str | Path | None = None,
+) -> Dict[str, str]:
+    artifact_path = Path(artifact_output)
+    artifact_path.parent.mkdir(parents=True, exist_ok=True)
+    artifact_path.write_text(
+        json.dumps(result["artifact"], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    paths = {"artifact_output": str(artifact_path)}
+    if audit_output:
+        audit_path = Path(audit_output)
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        audit_path.write_text(
+            json.dumps(result["local_audit"], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        paths["audit_output"] = str(audit_path)
+    return paths
+
+
+def render_review_prior_distillation_summary(result: Dict[str, Any]) -> str:
+    summary = result.get("summary", {})
+    local_audit = result.get("local_audit", {})
+    exact = local_audit.get("source_summary_exact", {})
+    lines = [
+        "# Reviewer Prior Distillation",
+        "",
+        f"- Target issues: {summary.get('target_issues', 0)}",
+        f"- Human issue clusters: {summary.get('human_issue_clusters', 0)}",
+        f"- Distilled priors: {summary.get('priors', 0)}",
+        f"- Excluded low-support clusters: {summary.get('excluded_clusters', 0)}",
+        f"- Privacy audit passed: {summary.get('privacy_passed', False)}",
+        f"- Runtime audit passed: {summary.get('runtime_audit_passed', False)}",
+        "",
+        "## Exact Local Counts",
+        "",
+        f"- Records: {exact.get('n_records', 0)}",
+        f"- Atomic issues: {exact.get('n_atomic_issues', 0)}",
+        f"- Target issues excluded: {exact.get('n_excluded_target_issues', 0)}",
+    ]
+    runtime_errors = local_audit.get("runtime_audit", {}).get("errors", [])
+    if runtime_errors:
+        lines.extend(["", "## Runtime Audit Errors", ""])
+        lines.extend(f"- {error}" for error in runtime_errors)
+    return "\n".join(lines)
 
 
 def score_reviewer_likelihood(
@@ -1776,6 +3089,138 @@ def _generated_issues_for_eval(pipeline_result: Dict[str, Any]) -> List[Dict[str
     return []
 
 
+REVIEW_PRIOR_EVAL_MODES = ("baseline", "safe_prior", "local_raw_memory")
+
+
+def _generated_issue_quality_summary(generated: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not generated:
+        return {
+            "generated_issue_count": 0,
+            "unsupported_issue_count": 0,
+            "unsupported_claim_rate": 0.0,
+        }
+    unsupported = 0
+    for issue in generated:
+        verification_status = str(issue.get("verification_status", "")).lower()
+        verified_support = str(issue.get("verified_support", "")).lower()
+        support_status = str(issue.get("support_status", "")).lower()
+        evidence_ids = issue.get("evidence_ids") or []
+        if verification_status in {"remove", "unsupported", "contradicted"}:
+            unsupported += 1
+        elif verified_support in {"unsupported", "contradicted"}:
+            unsupported += 1
+        elif support_status in {"unclear"} and not evidence_ids:
+            unsupported += 1
+    return {
+        "generated_issue_count": len(generated),
+        "unsupported_issue_count": unsupported,
+        "unsupported_claim_rate": round(unsupported / len(generated), 4),
+    }
+
+
+def _review_eval_metric_summary(split_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    evaluated = [item for item in split_results if item.get("metrics")]
+    summary = {
+        "splits": len(split_results),
+        "api_evaluated_splits": len(evaluated),
+        "extractable_splits": sum(1 for item in split_results if item.get("paper_text_status") == "ok"),
+        "total_estimated_cost_usd": round(sum(item.get("estimated_cost_usd", 0.0) for item in split_results), 6),
+    }
+    if not evaluated:
+        return summary
+
+    metric_keys = [
+        "human_issue_recall_at_k",
+        "major_issue_recall_at_k",
+        "human_issue_cluster_recall_at_k",
+        "major_issue_cluster_recall_at_k",
+        "reviewer_likelihood_precision_at_k",
+        "deduplicated_reviewer_likelihood_precision_at_k",
+        "duplicate_generated_cluster_matches",
+    ]
+    for key in metric_keys:
+        summary[f"mean_{key}"] = round(
+            sum(item["metrics"].get(key, 0.0) for item in evaluated) / len(evaluated),
+            4,
+        )
+    summary["mean_unsupported_claim_rate"] = round(
+        sum(item.get("generated_issue_quality", {}).get("unsupported_claim_rate", 0.0) for item in evaluated)
+        / len(evaluated),
+        4,
+    )
+    summary["mean_laundry_list_duplicate_rate"] = round(
+        sum(
+            (
+                item["metrics"].get("duplicate_generated_cluster_matches", 0)
+                / max(1, item.get("generated_issue_count", 0))
+            )
+            for item in evaluated
+        )
+        / len(evaluated),
+        4,
+    )
+    return summary
+
+
+def _review_prior_eval_gate(modes: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    required = ["baseline", "safe_prior", "local_raw_memory"]
+    if any(modes.get(mode, {}).get("summary", {}).get("api_evaluated_splits", 0) == 0 for mode in required):
+        return {
+            "status": "not_evaluated",
+            "passed": False,
+            "reason": "API-evaluated baseline, safe_prior, and local_raw_memory modes are required for deployment gate.",
+        }
+
+    baseline = modes["baseline"]["summary"]
+    safe = modes["safe_prior"]["summary"]
+    raw = modes["local_raw_memory"]["summary"]
+    key = "mean_major_issue_cluster_recall_at_k"
+    baseline_score = baseline.get(key, 0.0)
+    safe_score = safe.get(key, 0.0)
+    raw_score = raw.get(key, 0.0)
+    raw_gain = raw_score - baseline_score
+    safe_gain = safe_score - baseline_score
+    capture_ratio = None if raw_gain <= 0 else round(max(0.0, safe_gain) / raw_gain, 4)
+
+    checks = {
+        "major_issue_cluster_recall_improves": safe_score > baseline_score,
+        "deduplicated_precision_not_worse": (
+            safe.get("mean_deduplicated_reviewer_likelihood_precision_at_k", 0.0)
+            >= baseline.get("mean_deduplicated_reviewer_likelihood_precision_at_k", 0.0)
+        ),
+        "unsupported_claim_rate_not_worse": (
+            safe.get("mean_unsupported_claim_rate", 0.0)
+            <= baseline.get("mean_unsupported_claim_rate", 0.0)
+        ),
+        "laundry_list_duplicate_rate_not_worse": (
+            safe.get("mean_laundry_list_duplicate_rate", 0.0)
+            <= baseline.get("mean_laundry_list_duplicate_rate", 0.0)
+        ),
+    }
+    return {
+        "status": "evaluated",
+        "passed": all(checks.values()),
+        "checks": checks,
+        "major_issue_cluster_recall_at_k": {
+            "baseline": baseline_score,
+            "safe_prior": safe_score,
+            "local_raw_memory": raw_score,
+            "safe_prior_delta": round(safe_gain, 4),
+            "local_raw_memory_delta": round(raw_gain, 4),
+            "capture_ratio_vs_local_raw_memory": capture_ratio,
+        },
+    }
+
+
+def _batch_discounted_cost_estimate(cost: Dict[str, Any]) -> float:
+    """Estimate OpenAI Batch pricing for chat stages while leaving embeddings undiscounted."""
+    discounted = 0.0
+    for stage_name, summary in cost.get("stages", {}).items():
+        multiplier = 1.0 if stage_name == "clustering" else 0.5
+        discounted += float(summary.get("cost_usd", 0.0) or 0.0) * multiplier
+    return discounted
+
+
 async def run_historical_review_eval(
     archive_root: str | Path = DEFAULT_REVIEW_ARCHIVE_PATH,
     output_path: str | Path | None = None,
@@ -1832,8 +3277,16 @@ async def run_historical_review_eval(
             "status": "planned",
         }
         if paper_text.strip():
+            api_redaction = redact_identifying_info_for_api(paper_text)
+            api_paper_text = api_redaction["safe_text"]
+            item["api_redaction"] = {
+                "enabled": True,
+                "raw_chars": api_redaction["raw_chars"],
+                "safe_chars": api_redaction["safe_chars"],
+                "redactions": api_redaction["redactions"],
+            }
             cost = estimate_cost_before_run(
-                paper_text,
+                api_paper_text,
                 num_agents=num_agents,
                 gen_model=gen_model,
                 top_k=top_k,
@@ -1849,8 +3302,10 @@ async def run_historical_review_eval(
             item["status"] = "skipped_no_extractable_paper_text"
 
         if run_api and paper_text.strip():
+            api_redaction = redact_identifying_info_for_api(paper_text)
+            api_paper_text = api_redaction["safe_text"]
             pipeline_result = await full_feedback_pipeline(
-                paper_text,
+                api_paper_text,
                 num_agents=num_agents,
                 gen_model=gen_model,
                 top_k=top_k,
@@ -1946,6 +3401,270 @@ async def run_historical_review_eval(
         out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
         result["output_path"] = str(out)
     return result
+
+
+async def run_review_prior_eval_gate(
+    archive_root: str | Path = DEFAULT_REVIEW_ARCHIVE_PATH,
+    output_path: str | Path | None = None,
+    max_splits: int | None = None,
+    paper_ids: List[str] | None = None,
+    run_api: bool = False,
+    include_low_confidence: bool = False,
+    require_existing_pdf: bool = True,
+    num_agents: int = 8,
+    gen_model: str = GENERATION_MODEL,
+    top_k: int = 5,
+    routing: ModelRoutingConfig | None = None,
+    review_prior_min_papers: int = 3,
+    review_prior_min_comments: int = 3,
+    review_prior_top_k: int = 5,
+    batch_api: bool = False,
+) -> Dict[str, Any]:
+    """Evaluate baseline, safe-prior, and raw-memory modes on held-out reviews.
+
+    The safe-prior condition distills a fresh prior from each split's training
+    corpus only, so held-out paper-review pairs do not leak into the evaluated
+    prior artifact.
+    """
+    routing = routing or build_model_routing(gen_model=gen_model)
+    if run_api and batch_api and _ACTIVE_BATCH_CHAT_CLIENT is None:
+        raise ValueError("batch_api=True requires openai_batch_chat_context")
+    corpus = load_review_corpus(archive_root, include_low_confidence=include_low_confidence)
+    splits = build_review_holdout_splits(
+        corpus,
+        require_existing_pdf=require_existing_pdf,
+        max_splits=max_splits,
+        paper_ids=paper_ids,
+    )
+    issues_by_paper: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for issue in corpus.get("issues", []):
+        issues_by_paper[issue.get("paper_id", "")].append(issue)
+
+    mode_results: Dict[str, Dict[str, Any]] = {
+        mode: {"summary": {"mode": mode}, "splits": []}
+        for mode in REVIEW_PRIOR_EVAL_MODES
+    }
+    api_jobs: List[Any] = []
+
+    async def evaluate_item(
+        item: Dict[str, Any],
+        paper_id: str,
+        api_paper_text: str,
+        pipeline_kwargs: Dict[str, Any],
+    ) -> None:
+        pipeline_result = await full_feedback_pipeline(
+            api_paper_text,
+            num_agents=num_agents,
+            gen_model=gen_model,
+            top_k=top_k,
+            routing=routing,
+            **pipeline_kwargs,
+        )
+        generated = _generated_issues_for_eval(pipeline_result)
+        human_issues = issues_by_paper.get(paper_id, [])
+        item["generated_issue_count"] = len(generated)
+        item["generated_issue_summaries"] = [
+            {
+                "id": issue.get("id"),
+                "issue_family": issue.get("issue_family"),
+                "dimension": issue.get("dimension"),
+                "text": _shorten_for_triage(issue.get("text", ""), max_chars=1200),
+                "generation_source": issue.get("generation_source"),
+                "review_prior_id": issue.get("review_prior_id"),
+                "decision_risk_score": issue.get("decision_risk_score"),
+                "reviewer_likelihood_score": issue.get("reviewer_likelihood_score"),
+            }
+            for issue in generated
+        ]
+        item["metrics"] = compare_generated_to_human_issues(
+            generated,
+            human_issues,
+            top_k=top_k,
+        )
+        item["generated_issue_quality"] = _generated_issue_quality_summary(generated)
+        item["actual_usage"] = pipeline_result.get("actual_usage", {})
+        item["status"] = "api_evaluated"
+
+    for split in splits:
+        paper_id = split["paper_id"]
+        train_corpus = filter_review_corpus_for_holdout(corpus, paper_id)
+        paper_text, paper_text_status, paper_file = _extract_first_holdout_paper_text(split)
+        api_redaction: Dict[str, Any] | None = None
+        api_paper_text = ""
+        if paper_text.strip():
+            api_redaction = redact_identifying_info_for_api(paper_text)
+            api_paper_text = api_redaction["safe_text"]
+
+        safe_prior_result: Dict[str, Any] | None = None
+        safe_prior_artifact: Dict[str, Any] | None = None
+        if paper_text.strip():
+            safe_prior_result = distill_review_prior_from_corpus(
+                train_corpus,
+                min_support_papers=review_prior_min_papers,
+                min_support_comments=review_prior_min_comments,
+                artifact_version=f"holdout_{paper_id}",
+            )
+            safe_prior_artifact = safe_prior_result["artifact"]
+
+        for mode in REVIEW_PRIOR_EVAL_MODES:
+            item = {
+                "paper_id": paper_id,
+                "eval_mode": mode,
+                "review_files": split.get("review_files", []),
+                "matched_paper_file": paper_file,
+                "paper_text_status": paper_text_status,
+                "human_issue_candidate_count": split.get("human_issue_candidate_count", 0),
+                "human_issue_count": split.get("human_issue_count", 0),
+                "human_issue_cluster_count": split.get("human_issue_cluster_count", 0),
+                "major_issue_cluster_count": split.get("major_issue_cluster_count", 0),
+                "train_record_count": train_corpus["stats"]["records"],
+                "train_issue_count": train_corpus["stats"]["issues"],
+                "status": "planned",
+            }
+            if api_redaction:
+                item["api_redaction"] = {
+                    "enabled": True,
+                    "raw_chars": api_redaction["raw_chars"],
+                    "safe_chars": api_redaction["safe_chars"],
+                    "redactions": api_redaction["redactions"],
+                }
+            if not api_paper_text.strip():
+                item["status"] = "skipped_no_extractable_paper_text"
+                mode_results[mode]["splits"].append(item)
+                continue
+
+            cost_kwargs: Dict[str, Any] = {}
+            pipeline_kwargs: Dict[str, Any] = {}
+            if mode == "local_raw_memory":
+                cost_kwargs["review_corpus"] = train_corpus
+                pipeline_kwargs["review_corpus"] = train_corpus
+            elif mode == "safe_prior":
+                if not safe_prior_artifact or not review_prior_items(safe_prior_artifact):
+                    item["status"] = "skipped_no_train_prior"
+                    item["review_prior_summary"] = (safe_prior_result or {}).get("summary", {})
+                    mode_results[mode]["splits"].append(item)
+                    continue
+                if not safe_prior_artifact.get("privacy_audit", {}).get("passed"):
+                    item["status"] = "skipped_train_prior_privacy_failed"
+                    item["review_prior_summary"] = (safe_prior_result or {}).get("summary", {})
+                    mode_results[mode]["splits"].append(item)
+                    continue
+                cost_kwargs["review_prior"] = safe_prior_artifact
+                cost_kwargs["review_prior_top_k"] = review_prior_top_k
+                pipeline_kwargs["review_prior"] = safe_prior_artifact
+                pipeline_kwargs["review_prior_top_k"] = review_prior_top_k
+                item["review_prior_summary"] = {
+                    "priors": len(review_prior_items(safe_prior_artifact)),
+                    "privacy_passed": safe_prior_artifact.get("privacy_audit", {}).get("passed", False),
+                    "runtime_audit_passed": audit_review_prior_artifact(safe_prior_artifact)["passed"],
+                }
+
+            cost = estimate_cost_before_run(
+                api_paper_text,
+                num_agents=num_agents,
+                gen_model=gen_model,
+                top_k=top_k,
+                routing=routing,
+                **cost_kwargs,
+            )
+            estimated_cost = float(cost["estimated_total_cost_usd"])
+            if batch_api:
+                item["estimated_cost_usd_without_batch_discount"] = round(estimated_cost, 6)
+                item["batch_api_chat_price_multiplier"] = 0.5
+                estimated_cost = _batch_discounted_cost_estimate(cost)
+            item["estimated_cost_usd"] = round(estimated_cost, 6)
+            item["estimated_prompt_tokens"] = sum(
+                stage.get("prompt_tokens", 0) for stage in cost.get("stages", {}).values()
+            )
+
+            if run_api:
+                if batch_api:
+                    item["status"] = "queued_for_batch_api"
+                    mode_results[mode]["splits"].append(item)
+                    api_jobs.append(evaluate_item(item, paper_id, api_paper_text, dict(pipeline_kwargs)))
+                    continue
+                await evaluate_item(item, paper_id, api_paper_text, pipeline_kwargs)
+            else:
+                item["status"] = "dry_run_estimated"
+
+            mode_results[mode]["splits"].append(item)
+
+    if api_jobs:
+        await asyncio.gather(*api_jobs)
+
+    for mode, mode_result in mode_results.items():
+        summary = _review_eval_metric_summary(mode_result["splits"])
+        summary.update(
+            {
+                "mode": mode,
+                "archive_root": str(archive_root),
+                "run_mode": "api" if run_api else "dry_run",
+                "batch_api": batch_api,
+            }
+        )
+        mode_result["summary"] = summary
+
+    result = {
+        "summary": {
+            "archive_root": str(archive_root),
+            "run_mode": "api" if run_api else "dry_run",
+            "modes": list(REVIEW_PRIOR_EVAL_MODES),
+            "splits": len(splits),
+            "review_prior_min_papers": review_prior_min_papers,
+            "review_prior_min_comments": review_prior_min_comments,
+            "batch_api": batch_api,
+        },
+        "modes": mode_results,
+        "gate": _review_prior_eval_gate(mode_results),
+    }
+    if output_path:
+        out = Path(output_path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        result["output_path"] = str(out)
+    return result
+
+
+def render_review_prior_eval_gate_summary(result: Dict[str, Any]) -> str:
+    summary = result.get("summary", {})
+    lines = [
+        "# Review Prior Evaluation Gate",
+        "",
+        f"- Mode: {summary.get('run_mode', 'dry_run')}",
+        f"- Holdout splits: {summary.get('splits', 0)}",
+        f"- Eval modes: {', '.join(summary.get('modes', []))}",
+    ]
+    if result.get("output_path"):
+        lines.append(f"- Saved JSON: `{result['output_path']}`")
+    lines.extend(["", "## Mode Summary", "", "| Mode | Evaluated | Extractable | Est. cost | Major cluster recall@K | Unsupported rate | Duplicate rate |", "|---|---:|---:|---:|---:|---:|---:|"])
+    for mode in REVIEW_PRIOR_EVAL_MODES:
+        mode_summary = result.get("modes", {}).get(mode, {}).get("summary", {})
+        lines.append(
+            "| "
+            + " | ".join(
+                [
+                    mode,
+                    str(mode_summary.get("api_evaluated_splits", 0)),
+                    str(mode_summary.get("extractable_splits", 0)),
+                    f"${mode_summary.get('total_estimated_cost_usd', 0.0):.4f}",
+                    f"{mode_summary.get('mean_major_issue_cluster_recall_at_k', 0.0):.4f}",
+                    f"{mode_summary.get('mean_unsupported_claim_rate', 0.0):.4f}",
+                    f"{mode_summary.get('mean_laundry_list_duplicate_rate', 0.0):.4f}",
+                ]
+            )
+            + " |"
+        )
+    gate = result.get("gate", {})
+    lines.extend(["", "## Gate", ""])
+    lines.append(f"- Status: {gate.get('status')}")
+    lines.append(f"- Passed: {gate.get('passed')}")
+    if gate.get("reason"):
+        lines.append(f"- Reason: {gate.get('reason')}")
+    recall = gate.get("major_issue_cluster_recall_at_k", {})
+    if recall:
+        lines.append(f"- Safe-prior delta: {recall.get('safe_prior_delta', 0.0):.4f}")
+        lines.append(f"- Capture ratio vs local raw memory: {recall.get('capture_ratio_vs_local_raw_memory')}")
+    return "\n".join(lines)
 
 
 def render_historical_review_eval_summary(result: Dict[str, Any]) -> str:
@@ -2274,10 +3993,14 @@ def build_deterministic_evidence_index(paper_text: str) -> Dict[str, Any]:
 def format_evidence_index_for_prompt(
     evidence_index: Dict[str, Any],
     max_excerpt_chars: int = 900,
+    max_elements: int | None = None,
 ) -> str:
     """Format deterministic evidence IDs for an extraction or verification prompt."""
     formatted = []
-    for element in evidence_index.get("elements", []):
+    elements = evidence_index.get("elements", [])
+    if max_elements is not None:
+        elements = elements[: max(0, max_elements)]
+    for element in elements:
         text = re.sub(r"\s+", " ", element.get("text", "")).strip()
         if len(text) > max_excerpt_chars:
             text = text[: max_excerpt_chars - 3].rstrip() + "..."
@@ -2287,6 +4010,48 @@ def format_evidence_index_for_prompt(
             f"{element['line_start']}-{element['line_end']}: {text}"
         )
     return "\n".join(formatted)
+
+
+def _int_env(name: str, default: int | None = None) -> int | None:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        return default
+    return parsed if parsed >= 0 else default
+
+
+def _chat_json_concurrency_limit() -> int | None:
+    limit = _int_env("FEEDBACK_LLM_MAX_CONCURRENT_REQUESTS")
+    return limit if limit and limit > 0 else None
+
+
+def _chat_json_semaphore(limit: int) -> asyncio.Semaphore:
+    global _CHAT_JSON_SEMAPHORE, _CHAT_JSON_SEMAPHORE_LIMIT, _CHAT_JSON_SEMAPHORE_LOOP
+    loop = asyncio.get_running_loop()
+    if (
+        _CHAT_JSON_SEMAPHORE is None
+        or _CHAT_JSON_SEMAPHORE_LIMIT != limit
+        or _CHAT_JSON_SEMAPHORE_LOOP is not loop
+    ):
+        _CHAT_JSON_SEMAPHORE = asyncio.Semaphore(limit)
+        _CHAT_JSON_SEMAPHORE_LIMIT = limit
+        _CHAT_JSON_SEMAPHORE_LOOP = loop
+    return _CHAT_JSON_SEMAPHORE
+
+
+def _cap_text_for_local_model(text: str, max_chars: int | None) -> str:
+    if not max_chars or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    marker = "\n\n[... manuscript text truncated for local model context ...]\n\n"
+    if max_chars <= len(marker) + 20:
+        return text[:max_chars].rstrip()
+    remaining = max_chars - len(marker)
+    head_chars = int(remaining * 0.7)
+    tail_chars = remaining - head_chars
+    return text[:head_chars].rstrip() + marker + text[-tail_chars:].lstrip()
 
 
 def extract_cited_evidence_ids(report_text: str) -> List[str]:
@@ -3030,6 +4795,8 @@ def _evidence_map_messages(evidence_index: Dict[str, Any]) -> List[Dict[str, str
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    max_elements = _int_env("FEEDBACK_LLM_EVIDENCE_MAP_MAX_ELEMENTS")
+    max_excerpt_chars = _int_env("FEEDBACK_LLM_EVIDENCE_MAP_EXCERPT_CHARS", 900) or 900
     user_content = f"""
 Extract a manuscript evidence map from the evidence-indexed paper below.
 
@@ -3047,7 +4814,7 @@ Quarantined instruction-like text:
 
 Evidence index:
 ```text
-{format_evidence_index_for_prompt(evidence_index)}
+{format_evidence_index_for_prompt(evidence_index, max_excerpt_chars=max_excerpt_chars, max_elements=max_elements)}
 ```
 """.strip()
     return [
@@ -3205,6 +4972,7 @@ def _generation_user_prompt(
     worker_id: int,
     evidence_map: Dict[str, Any] | None = None,
     review_memory_context: str = "",
+    review_prior_gap_context: str = "",
 ) -> str:
     if evidence_map:
         manuscript_context = _generation_context_from_evidence_map(evidence_map)
@@ -3220,6 +4988,16 @@ def _generation_user_prompt(
 Historical review memory:
 ```text
 {review_memory_context}
+```
+""".rstrip()
+
+    prior_gap_block = ""
+    if review_prior_gap_context:
+        prior_gap_block = f"""
+
+Structured reviewer-prior gap checks:
+```text
+{review_prior_gap_context}
 ```
 """.rstrip()
 
@@ -3256,6 +5034,9 @@ Technical specificity must be excerpt-grounded:
   as a diagnostic check unless manuscript evidence directly supports a stronger claim.
 - If historical review memory is provided, use it only to calibrate tone, specificity, and likely reviewer
   salience. Do not import facts, paper details, reviewer claims, or evidence from historical examples.
+- If structured reviewer-prior gap checks are provided, use them only to choose a high-salience missing check
+  to inspect after the cold review pass. The prior may raise a diagnostic question, but it is not evidence.
+  Only manuscript evidence IDs can support the critique, and already-addressed checks must be demoted.
 
 Persona consistency:
 - Conceptual/theoretical feedback: do not introduce econometric implementation details.
@@ -3276,6 +5057,7 @@ Return a JSON object with exactly these fields:
 {context_label}:
 {manuscript_context}
 {memory_block}
+{prior_gap_block}
 """.strip()
 
 
@@ -3292,6 +5074,7 @@ def _generation_messages(
     worker_id: int,
     evidence_map: Dict[str, Any] | None = None,
     review_memory_context: str = "",
+    review_prior_gap_context: str = "",
 ) -> List[Dict[str, str]]:
     system_prompt = GENERATION_SYSTEM_PROMPT
     if persona_prompt:
@@ -3305,6 +5088,7 @@ def _generation_messages(
                 worker_id,
                 evidence_map=evidence_map,
                 review_memory_context=review_memory_context,
+                review_prior_gap_context=review_prior_gap_context,
             ),
         },
     ]
@@ -3789,6 +5573,7 @@ EDITORIAL_TRIAGE_SYSTEM_PROMPT = (
 def _editorial_triage_messages(
     selection: Dict[str, Any],
     review_memory_context: str = "",
+    review_prior_context: str = "",
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]]]:
     issue_inputs = build_editorial_issue_inputs(selection)
     profile_json = json.dumps(selection.get("substantive_profile", {}), ensure_ascii=False)
@@ -3804,6 +5589,18 @@ Historical review memory for calibration only:
 
 Use this memory only to calibrate reviewer likelihood, decision relevance, tone, and specificity.
 Do not import historical-paper facts or cite historical comments as evidence.
+""".rstrip()
+    prior_block = ""
+    if review_prior_context:
+        prior_block = f"""
+
+Structured reviewer-prior calibration:
+```text
+{review_prior_context}
+```
+
+Use this structured prior only to calibrate reviewer likelihood, decision-tier salience,
+and wording. It may not change whether a critique is supported by manuscript evidence.
 """.rstrip()
 
     user_content = f"""
@@ -3880,6 +5677,7 @@ Issue inputs:
 {issues_json}
 ```
 {memory_block}
+{prior_block}
 """.strip()
     return [
         {"role": "system", "content": EDITORIAL_TRIAGE_SYSTEM_PROMPT},
@@ -3891,10 +5689,15 @@ async def editorial_triage(
     selection: Dict[str, Any],
     model: str = TRIAGE_MODEL,
     review_memory_context: str = "",
+    review_prior_context: str = "",
     tracker: "UsageTracker | None" = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """Classify verified issues by publication-decision relevance."""
-    messages, issue_inputs = _editorial_triage_messages(selection, review_memory_context=review_memory_context)
+    messages, issue_inputs = _editorial_triage_messages(
+        selection,
+        review_memory_context=review_memory_context,
+        review_prior_context=review_prior_context,
+    )
     if not issue_inputs:
         empty = {
             "editorial_diagnosis": "mostly_minor_issues",
@@ -4045,6 +5848,256 @@ def get_client() -> AsyncOpenAI:
         ensure_api_key()
         client = AsyncOpenAI()
     return client
+
+
+def _plain_openai_object(value: Any) -> Any:
+    """Convert OpenAI SDK objects into JSON-serializable containers."""
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, dict):
+        return {key: _plain_openai_object(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_plain_openai_object(item) for item in value]
+    return value
+
+
+def _namespace_from_mapping(value: Any) -> Any:
+    """Convert nested usage mappings into objects with attribute access."""
+    if isinstance(value, dict):
+        return SimpleNamespace(**{key: _namespace_from_mapping(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return [_namespace_from_mapping(item) for item in value]
+    return value
+
+
+class OpenAIBatchChatClient:
+    """Batch API adapter for chat-completion calls.
+
+    The feedback pipeline has dependent stages, so this adapter batches each
+    concurrent wave of chat calls, waits for completion, then lets the dependent
+    local code continue. It preserves the normal pipeline semantics while using
+    OpenAI Batch pricing for chat completions.
+    """
+
+    def __init__(
+        self,
+        output_dir: str | Path,
+        poll_interval_seconds: float = 30.0,
+        wait_timeout_seconds: float | None = None,
+        flush_delay_seconds: float = 0.25,
+    ):
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.poll_interval_seconds = max(1.0, poll_interval_seconds)
+        self.wait_timeout_seconds = wait_timeout_seconds if wait_timeout_seconds and wait_timeout_seconds > 0 else None
+        self.flush_delay_seconds = max(0.01, flush_delay_seconds)
+        self.price_multiplier = 0.5
+        self._pending: List[Dict[str, Any]] = []
+        self._flush_task: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
+        self._batch_counter = 0
+        self.submissions: List[Dict[str, Any]] = []
+        self.manifest_path = self.output_dir / "batch_manifest.json"
+
+    async def chat_completion(self, request_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        async with self._lock:
+            self._pending.append({"request_kwargs": request_kwargs, "future": future})
+            if self._flush_task is None or self._flush_task.done():
+                self._flush_task = asyncio.create_task(self._flush_after_delay())
+        return await future
+
+    async def flush_pending(self) -> None:
+        task = self._flush_task
+        if task and not task.done():
+            await task
+        async with self._lock:
+            pending = self._pending
+            self._pending = []
+        if pending:
+            await self._run_batch(pending)
+
+    async def _flush_after_delay(self) -> None:
+        await asyncio.sleep(self.flush_delay_seconds)
+        async with self._lock:
+            pending = self._pending
+            self._pending = []
+            self._flush_task = None
+        if pending:
+            await self._run_batch(pending)
+
+    def _write_manifest(self) -> None:
+        manifest = {
+            "created_at": int(time.time()),
+            "endpoint": "/v1/chat/completions",
+            "pricing_note": "OpenAI Batch API chat completions are estimated at 50% of synchronous pricing.",
+            "batches": self.submissions,
+        }
+        self.manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    async def _run_batch(self, requests: List[Dict[str, Any]]) -> None:
+        self._batch_counter += 1
+        batch_no = self._batch_counter
+        input_path = self.output_dir / f"chat_batch_{batch_no:04d}_input.jsonl"
+        output_path = self.output_dir / f"chat_batch_{batch_no:04d}_output.jsonl"
+        request_by_id: Dict[str, Dict[str, Any]] = {}
+        lines = []
+        for idx, request in enumerate(requests, start=1):
+            custom_id = f"chat_batch_{batch_no:04d}_request_{idx:04d}"
+            request_by_id[custom_id] = request
+            lines.append(
+                json.dumps(
+                    {
+                        "custom_id": custom_id,
+                        "method": "POST",
+                        "url": "/v1/chat/completions",
+                        "body": request["request_kwargs"],
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+        input_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        submission: Dict[str, Any] = {
+            "batch_no": batch_no,
+            "request_count": len(requests),
+            "input_path": str(input_path),
+            "output_path": str(output_path),
+            "status": "uploading",
+            "submitted_at": int(time.time()),
+        }
+        self.submissions.append(submission)
+        self._write_manifest()
+
+        try:
+            with input_path.open("rb") as handle:
+                input_file = await get_client().files.create(file=handle, purpose="batch")
+            submission["input_file_id"] = input_file.id
+            submission["status"] = "submitted"
+            batch = await get_client().batches.create(
+                input_file_id=input_file.id,
+                endpoint="/v1/chat/completions",
+                completion_window="24h",
+                metadata={
+                    "job": "feedback_llm_review_prior_eval",
+                    "batch_no": str(batch_no),
+                },
+            )
+            submission["batch_id"] = batch.id
+            submission["status"] = batch.status
+            self._write_manifest()
+
+            batch = await self._poll_batch(batch.id, submission)
+            if batch.status != "completed":
+                raise RuntimeError(f"Batch {batch.id} ended with status {batch.status}")
+
+            submission["output_file_id"] = batch.output_file_id
+            submission["error_file_id"] = batch.error_file_id
+            if not batch.output_file_id:
+                raise RuntimeError(f"Batch {batch.id} completed without an output file")
+            content = await get_client().files.content(batch.output_file_id)
+            raw = await content.aread()
+            output_text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            output_path.write_text(output_text, encoding="utf-8")
+            self._resolve_batch_output(output_text, request_by_id)
+            submission["status"] = "completed"
+            submission["completed_at"] = int(time.time())
+            self._write_manifest()
+        except Exception as exc:
+            submission["status"] = "failed"
+            submission["error"] = str(exc)
+            self._write_manifest()
+            for request in requests:
+                future = request["future"]
+                if not future.done():
+                    future.set_exception(exc)
+
+    async def _poll_batch(self, batch_id: str, submission: Dict[str, Any]) -> Any:
+        deadline = (
+            time.monotonic() + self.wait_timeout_seconds
+            if self.wait_timeout_seconds is not None
+            else None
+        )
+        while True:
+            batch = await get_client().batches.retrieve(batch_id)
+            submission["status"] = batch.status
+            submission["request_counts"] = _plain_openai_object(getattr(batch, "request_counts", None))
+            submission["last_polled_at"] = int(time.time())
+            self._write_manifest()
+            if batch.status in {"completed", "failed", "expired", "cancelled"}:
+                return batch
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Batch {batch_id} is still {batch.status} after "
+                    f"{self.wait_timeout_seconds:.0f}s; manifest saved at {self.manifest_path}"
+                )
+            await asyncio.sleep(self.poll_interval_seconds)
+
+    def _resolve_batch_output(
+        self,
+        output_text: str,
+        request_by_id: Dict[str, Dict[str, Any]],
+    ) -> None:
+        seen: set[str] = set()
+        for line in output_text.splitlines():
+            if not line.strip():
+                continue
+            payload = json.loads(line)
+            custom_id = payload.get("custom_id")
+            seen.add(custom_id)
+            request = request_by_id.get(custom_id)
+            if not request:
+                continue
+            future = request["future"]
+            if future.done():
+                continue
+            error = payload.get("error")
+            response = payload.get("response") or {}
+            status_code = response.get("status_code")
+            if error:
+                future.set_exception(RuntimeError(f"Batch request {custom_id} failed: {error}"))
+                continue
+            if status_code and int(status_code) >= 400:
+                future.set_exception(
+                    RuntimeError(
+                        f"Batch request {custom_id} returned HTTP {status_code}: "
+                        f"{response.get('body')}"
+                    )
+                )
+                continue
+            future.set_result(response.get("body", {}))
+
+        missing = set(request_by_id) - seen
+        for custom_id in missing:
+            future = request_by_id[custom_id]["future"]
+            if not future.done():
+                future.set_exception(RuntimeError(f"Batch output missing custom_id {custom_id}"))
+
+
+@asynccontextmanager
+async def openai_batch_chat_context(
+    output_dir: str | Path,
+    poll_interval_seconds: float = 30.0,
+    wait_timeout_seconds: float | None = None,
+):
+    """Route chat completions through OpenAI Batch API inside the context."""
+    global _ACTIVE_BATCH_CHAT_CLIENT
+    previous = _ACTIVE_BATCH_CHAT_CLIENT
+    manager = OpenAIBatchChatClient(
+        output_dir=output_dir,
+        poll_interval_seconds=poll_interval_seconds,
+        wait_timeout_seconds=wait_timeout_seconds,
+    )
+    _ACTIVE_BATCH_CHAT_CLIENT = manager
+    try:
+        yield manager
+    finally:
+        try:
+            await manager.flush_pending()
+        finally:
+            _ACTIVE_BATCH_CHAT_CLIENT = previous
 
 
 class UsageTracker:
@@ -4323,6 +6376,24 @@ def json_schema_response_format(
     }
 
 
+def _chat_request_kwargs(
+    messages: List[Dict[str, str]],
+    model: str,
+    response_format: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    """Build Chat Completions kwargs with tier-aware reasoning defaults."""
+    request_kwargs: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+    }
+    if response_format is not None:
+        request_kwargs["response_format"] = response_format
+    reasoning_effort = MODEL_REASONING_EFFORT.get(model)
+    if reasoning_effort is not None:
+        request_kwargs["reasoning_effort"] = reasoning_effort
+    return request_kwargs
+
+
 async def chat_json(
     messages: List[Dict[str, str]],
     model: str = GENERATION_MODEL,
@@ -4336,15 +6407,52 @@ async def chat_json(
         if schema is not None
         else {"type": "json_object"}
     )
-    resp = await get_client().chat.completions.create(
-        model=model,
-        messages=messages,
+    request_kwargs = _chat_request_kwargs(
+        messages,
+        model,
         response_format=response_format,
     )
+    if _ACTIVE_BATCH_CHAT_CLIENT is not None:
+        body = await _ACTIVE_BATCH_CHAT_CLIENT.chat_completion(request_kwargs)
+        if tracker:
+            tracker.record(_namespace_from_mapping(body.get("usage")))
+        content = body["choices"][0]["message"]["content"]
+        return json.loads(content)
+
+    limit = _chat_json_concurrency_limit()
+    if limit:
+        async with _chat_json_semaphore(limit):
+            resp = await get_client().chat.completions.create(**request_kwargs)
+    else:
+        resp = await get_client().chat.completions.create(**request_kwargs)
     if tracker:
         tracker.record(resp.usage)
     content = resp.choices[0].message.content
     return json.loads(content)
+
+
+async def chat_text(
+    messages: List[Dict[str, str]],
+    model: str = GENERATION_MODEL,
+    tracker: "UsageTracker | None" = None,
+) -> str:
+    """Call the chat API and return plain text, honoring Batch API context."""
+    request_kwargs = _chat_request_kwargs(messages, model)
+    if _ACTIVE_BATCH_CHAT_CLIENT is not None:
+        body = await _ACTIVE_BATCH_CHAT_CLIENT.chat_completion(request_kwargs)
+        if tracker:
+            tracker.record(_namespace_from_mapping(body.get("usage")))
+        return body["choices"][0]["message"]["content"]
+
+    limit = _chat_json_concurrency_limit()
+    if limit:
+        async with _chat_json_semaphore(limit):
+            resp = await get_client().chat.completions.create(**request_kwargs)
+    else:
+        resp = await get_client().chat.completions.create(**request_kwargs)
+    if tracker:
+        tracker.record(resp.usage)
+    return resp.choices[0].message.content
 
 
 async def chat_json_with_retry(
@@ -4437,6 +6545,7 @@ async def generate_all_proposals(
     model: str,  # CHANGED: Now accepts specific model
     evidence_map: Dict[str, Any] | None = None,
     review_memory_context: str = "",
+    review_prior_gap_context: str = "",
     tracker: "UsageTracker | None" = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Generate proposals with partial failure recovery.
@@ -4453,6 +6562,7 @@ async def generate_all_proposals(
             assignment["id"],
             evidence_map=evidence_map,
             review_memory_context=review_memory_context,
+            review_prior_gap_context=review_prior_gap_context,
         )
         # Use retry wrapper for transient errors
         task = chat_json_with_retry(
@@ -4477,6 +6587,97 @@ async def generate_all_proposals(
             successful.append(_normalize_generated_proposal(result, worker))
 
     return successful, failed
+
+
+def create_review_prior_gap_workers(
+    gaps: List[Dict[str, Any]],
+    start_id: int,
+    design_type: str = "unclear",
+) -> List[Dict[str, Any]]:
+    """Create targeted workers, one per selected structured reviewer-prior gap."""
+    workers = []
+    for offset, gap in enumerate(gaps, start=1):
+        prior = gap.get("prior", {})
+        prior_id = prior.get("prior_id", f"prior_gap_{offset}")
+        issue_type = infer_issue_type(
+            " ".join(
+                [
+                    str(prior.get("reviewer_concern", "")),
+                    " ".join(str(item) for item in prior.get("raise_if_missing", [])),
+                ]
+            )
+        )
+        role = "methodologist" if issue_type in {"identification", "measurement", "robustness"} else "rival"
+        persona = (
+            "You are a post-cold-pass reviewer-prior gap checker. The first review pass has already "
+            "identified paper-specific issues. Your task is narrower: inspect only the assigned structured "
+            f"reviewer-prior gap `{prior_id}` and decide whether the manuscript evidence supports one "
+            "additional diagnostic concern. If the manuscript already addresses the check, or if the prior "
+            "is not supported by manuscript evidence, return a low-confidence diagnostic concern rather "
+            "than overstating the problem."
+        )
+        workers.append(
+            {
+                "id": start_id + offset,
+                "role": f"review_prior_gap_{role}",
+                "design_type": design_type,
+                "perspective_focus": prior_id,
+                "persona": persona,
+                "review_prior_gap": gap,
+            }
+        )
+    return workers
+
+
+async def generate_review_prior_gap_proposals(
+    paper_text: str,
+    evidence_map: Dict[str, Any],
+    prior_artifact: Dict[str, Any],
+    existing_issues: List[Dict[str, Any]],
+    model: str,
+    start_id: int,
+    design_type: str = "unclear",
+    top_k: int = 5,
+    tracker: "UsageTracker | None" = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], str]:
+    """Generate targeted proposals for unsatisfied structured reviewer-prior gaps."""
+    gaps = select_review_prior_gaps(
+        evidence_map,
+        prior_artifact,
+        existing_issues=existing_issues,
+        use_for="generation_checklist",
+        top_k=top_k,
+    )
+    if not gaps:
+        return [], [], [], ""
+    gap_context = build_review_prior_gap_context(
+        evidence_map,
+        prior_artifact,
+        existing_issues=existing_issues,
+        top_k=top_k,
+    )
+    workers = create_review_prior_gap_workers(
+        gaps,
+        start_id=start_id,
+        design_type=design_type,
+    )
+    proposals, failures = await generate_all_proposals(
+        paper_text,
+        workers,
+        model,
+        evidence_map=evidence_map,
+        review_prior_gap_context=gap_context,
+        tracker=tracker,
+    )
+    gap_by_worker_id = {worker["id"]: worker.get("review_prior_gap", {}) for worker in workers}
+    for proposal in proposals:
+        gap = gap_by_worker_id.get(proposal.get("id"), {})
+        prior = gap.get("prior", {})
+        proposal["generation_source"] = "review_prior_gap"
+        proposal["review_prior_id"] = prior.get("prior_id", "")
+        proposal["review_prior_missing_checks"] = gap.get("missing_checks", [])
+        proposal["review_prior_decision_weight"] = gap.get("decision_weight")
+    return proposals, failures, gaps, gap_context
 
 
 # -------------------------------------------------------------------
@@ -5290,6 +7491,8 @@ def rebuild_selection_from_high_quality(
             "num_presentation_clusters",
             "substantive_profile",
             "substantive_checks",
+            "review_prior",
+            "review_prior_gaps",
         ]:
             if key in base_selection:
                 rebuilt[key] = base_selection[key]
@@ -5391,13 +7594,7 @@ async def meta_review(
     last_error = None
     for attempt in range(3):
         try:
-            resp = await get_client().chat.completions.create(
-                model=model,
-                messages=messages,
-            )
-            if tracker:
-                tracker.record(resp.usage)
-            return resp.choices[0].message.content
+            return await chat_text(messages, model=model, tracker=tracker)
         except (RateLimitError, APIConnectionError, APITimeoutError) as e:
             last_error = e
             if attempt < 2:
@@ -5418,6 +7615,9 @@ def estimate_cost_before_run(
     routing: ModelRoutingConfig | None = None,
     review_corpus_path: str | None = None,
     review_corpus: Dict[str, Any] | None = None,
+    review_prior_path: str | None = None,
+    review_prior: Dict[str, Any] | None = None,
+    review_prior_top_k: int = 5,
 ) -> Dict[str, Any]:
     """Estimate cost BEFORE running the pipeline.
 
@@ -5437,9 +7637,18 @@ def estimate_cost_before_run(
     escalation_model = routing.escalation
 
     evidence_index = build_deterministic_evidence_index(paper_text)
+    evidence_profile = build_substantive_design_profile(evidence_index)
+    evidence_index["substantive_profile"] = evidence_profile
+    evidence_index["substantive_checks"] = build_substantive_checklist_findings(
+        evidence_index,
+        evidence_profile,
+    )
     review_text = evidence_index.get("safe_text", paper_text)
     design_type = _design_type_from_evidence_map(evidence_index)
     review_memory_context = ""
+    active_review_prior: Dict[str, Any] | None = review_prior
+    review_prior_triage_context = ""
+    prior_gap_count = 0
     if review_corpus_path or review_corpus:
         corpus = review_corpus or load_review_corpus(review_corpus_path)
         review_memory_query = build_review_memory_query(review_text, evidence_map=evidence_index)
@@ -5448,6 +7657,21 @@ def estimate_cost_before_run(
             corpus,
             top_k=5,
             design_type=design_type,
+        )
+    if review_prior_path or active_review_prior:
+        active_review_prior = active_review_prior or load_review_prior(review_prior_path)
+        review_prior_triage_context = build_review_prior_triage_context(
+            evidence_index,
+            active_review_prior,
+            top_k=review_prior_top_k,
+        )
+        prior_gap_count = len(
+            select_review_prior_gaps(
+                evidence_index,
+                active_review_prior,
+                existing_issues=[],
+                top_k=review_prior_top_k,
+            )
         )
 
     # Create mock workers to get persona prompts
@@ -5460,16 +7684,44 @@ def estimate_cost_before_run(
 
     # Estimate generation stage
     gen_prompt_tokens = 0
+    cold_review_memory_context = "" if active_review_prior else review_memory_context
     for worker in workers:
         messages = _generation_messages(
             worker["persona"],
             review_text,
             worker["id"],
             evidence_map=evidence_index,
-            review_memory_context=review_memory_context,
+            review_memory_context=cold_review_memory_context,
         )
         gen_prompt_tokens += _count_message_tokens(messages, gen_model)
-    gen_completion_tokens = num_agents * 150  # ~100 words + JSON overhead per proposal
+    if active_review_prior and prior_gap_count:
+        gap_context = build_review_prior_gap_context(
+            evidence_index,
+            active_review_prior,
+            existing_issues=[],
+            top_k=review_prior_top_k,
+        )
+        gap_workers = create_review_prior_gap_workers(
+            select_review_prior_gaps(
+                evidence_index,
+                active_review_prior,
+                existing_issues=[],
+                top_k=review_prior_top_k,
+            ),
+            start_id=num_agents,
+            design_type=design_type,
+        )
+        for worker in gap_workers:
+            messages = _generation_messages(
+                worker["persona"],
+                review_text,
+                worker["id"],
+                evidence_map=evidence_index,
+                review_prior_gap_context=gap_context,
+            )
+            gen_prompt_tokens += _count_message_tokens(messages, gen_model)
+    estimated_proposals = num_agents + prior_gap_count
+    gen_completion_tokens = estimated_proposals * 150  # ~100 words + JSON overhead per proposal
 
     # Estimate scoring stage (2 passes per proposal)
     # Each scoring prompt includes paper + proposal text
@@ -5488,10 +7740,10 @@ def estimate_cost_before_run(
     }
     scoring_messages = _scoring_messages(review_text, sample_proposal)
     single_score_prompt = _count_message_tokens(scoring_messages, score_model)
-    score_prompt_tokens = 2 * num_agents * single_score_prompt  # 2 passes
-    score_completion_tokens = 2 * num_agents * 50  # ~50 tokens per score response
+    score_prompt_tokens = 2 * estimated_proposals * single_score_prompt  # 2 passes
+    score_completion_tokens = 2 * estimated_proposals * 50  # ~50 tokens per score response
 
-    estimated_escalations = max(1, num_agents // 4)
+    estimated_escalations = max(1, estimated_proposals // 4)
     escalation_prompt_tokens = estimated_escalations * _count_message_tokens(
         _scoring_messages(review_text, sample_proposal),
         escalation_model,
@@ -5499,17 +7751,17 @@ def estimate_cost_before_run(
     escalation_completion_tokens = estimated_escalations * 80
 
     # Estimate verifier adjudication and constrained rewrite (worst case: all proposals kept)
-    verification_prompt_tokens = num_agents * _count_message_tokens(
+    verification_prompt_tokens = estimated_proposals * _count_message_tokens(
         _verification_messages(evidence_index, sample_proposal),
         verification_model,
     )
-    verification_completion_tokens = num_agents * 120
+    verification_completion_tokens = estimated_proposals * 120
 
-    rewrite_prompt_tokens = num_agents * _count_message_tokens(
+    rewrite_prompt_tokens = estimated_proposals * _count_message_tokens(
         _constrained_rewrite_messages(sample_proposal),
         rewrite_model,
     )
-    rewrite_completion_tokens = num_agents * 150
+    rewrite_completion_tokens = estimated_proposals * 150
 
     # Presentation clustering uses embeddings and deterministic annotation only.
     cluster_prompt_tokens = 0
@@ -5522,7 +7774,7 @@ def estimate_cost_before_run(
             "Problem: Sample proposal text for estimation." * 2,
             gen_model,
         )
-        for _ in range(num_agents)
+        for _ in range(estimated_proposals)
     )
     embed_cost = embed_tokens * 0.02 / 1e6  # text-embedding-3-small pricing
 
@@ -5547,11 +7799,12 @@ def estimate_cost_before_run(
     triage_messages, _triage_issue_inputs = _editorial_triage_messages(
         sample_selection,
         review_memory_context=review_memory_context,
+        review_prior_context=review_prior_triage_context,
     )
     triage_prompt_tokens = _count_message_tokens(triage_messages, triage_model)
     triage_completion_tokens = 800
 
-    meta_prompt_tokens = _count_text_tokens(review_text, meta_model) + num_agents * 200 + 900
+    meta_prompt_tokens = _count_text_tokens(review_text, meta_model) + estimated_proposals * 200 + 900
     meta_completion_tokens = 800  # Typical editorial report length
 
     # Calculate costs
@@ -5604,6 +7857,11 @@ def compute_actual_cost(
 ) -> Dict[str, Any]:
     """Compute actual cost from tracked API usage data."""
     routing = routing or build_model_routing(gen_model=gen_model)
+    chat_price_multiplier = (
+        _ACTIVE_BATCH_CHAT_CLIENT.price_multiplier
+        if _ACTIVE_BATCH_CHAT_CLIENT is not None
+        else 1.0
+    )
     stage_models = {
         "evidence_map": routing.verification,
         "generation": routing.generation,
@@ -5641,7 +7899,7 @@ def compute_actual_cost(
             non_cached_input * pricing["input"]
             + cached * pricing["cached_input"]
             + usage["completion_tokens"] * pricing["output"]
-        )
+        ) * chat_price_multiplier
 
         stages[stage_name] = {
             "model": model,
@@ -5667,6 +7925,8 @@ def compute_actual_cost(
         "total_cost_usd": total_cost,
         "total_requests": total_requests,
         "source": "actual",
+        "pricing_mode": "openai_batch" if chat_price_multiplier < 1 else "synchronous_api",
+        "chat_price_multiplier": chat_price_multiplier,
     }
 
 
@@ -5685,6 +7945,9 @@ async def full_feedback_pipeline(
     include_audit_appendix: bool = False,
     review_corpus_path: str | None = None,
     review_corpus: Dict[str, Any] | None = None,
+    review_prior_path: str | None = None,
+    review_prior: Dict[str, Any] | None = None,
+    review_prior_top_k: int = 5,
     progress_callback: Any = None,
 ) -> Dict[str, Any]:
     """Run the full async feedback pipeline for a single paper.
@@ -5713,10 +7976,19 @@ async def full_feedback_pipeline(
     review_text = evidence_map.get("safe_text", "").strip()
     if not review_text:
         raise ValueError("No reviewable manuscript text remained after safety quarantine.")
+    review_text = _cap_text_for_local_model(
+        review_text,
+        _int_env("FEEDBACK_LLM_REVIEW_TEXT_MAX_CHARS"),
+    )
     design_type = _design_type_from_evidence_map(evidence_map)
     review_memory_context = ""
     active_review_corpus: Dict[str, Any] | None = review_corpus
     review_corpus_summary: Dict[str, Any] | None = None
+    active_review_prior: Dict[str, Any] | None = review_prior
+    review_prior_runtime_audit: Dict[str, Any] | None = None
+    review_prior_gaps: List[Dict[str, Any]] = []
+    prior_gap_proposals: List[Dict[str, Any]] = []
+    review_prior_triage_context = ""
     if review_corpus_path or active_review_corpus:
         if active_review_corpus is None:
             active_review_corpus = load_review_corpus(review_corpus_path)
@@ -5734,18 +8006,42 @@ async def full_feedback_pipeline(
                 f"{review_corpus_summary.get('records', 0)} records, "
                 f"{review_corpus_summary.get('issues', 0)} issue candidates"
             )
+    if review_prior_path or active_review_prior:
+        if active_review_prior is None:
+            active_review_prior = load_review_prior(review_prior_path)
+        else:
+            review_prior_runtime_audit = audit_review_prior_artifact(active_review_prior)
+            if not review_prior_runtime_audit["passed"]:
+                raise ValueError(
+                    "Review prior failed audit: "
+                    + "; ".join(review_prior_runtime_audit["errors"])
+                )
+        review_prior_runtime_audit = active_review_prior.get(
+            "runtime_audit",
+            review_prior_runtime_audit or audit_review_prior_artifact(active_review_prior),
+        )
+        review_prior_triage_context = build_review_prior_triage_context(
+            evidence_map,
+            active_review_prior,
+            top_k=review_prior_top_k,
+        )
+        _progress(
+            "  Structured review prior enabled: "
+            f"{len(review_prior_items(active_review_prior))} priors"
+        )
 
     # 1. Create workers dynamically
     workers = create_worker_assignments(num_agents, design_type=design_type)
 
     tracker.set_stage("generation")
     report_progress(2, total_steps, f"Generating proposals with {num_agents} agents...")
+    cold_review_memory_context = "" if active_review_prior else review_memory_context
     proposals, failed_generations = await generate_all_proposals(
         review_text,
         workers,
         routing.generation,
         evidence_map=evidence_map,
-        review_memory_context=review_memory_context,
+        review_memory_context=cold_review_memory_context,
         tracker=tracker,
     )
 
@@ -5753,6 +8049,29 @@ async def full_feedback_pipeline(
         print(f"Warning: {len(failed_generations)} of {num_agents} proposal generations failed", file=sys.stderr)
     if not proposals:
         raise ValueError("All proposal generations failed. Check your API key and network connection.")
+
+    if active_review_prior:
+        report_progress(2, total_steps, "Generating targeted reviewer-prior gap proposals...")
+        prior_gap_proposals, prior_gap_failures, review_prior_gaps, _prior_gap_context = (
+            await generate_review_prior_gap_proposals(
+                review_text,
+                evidence_map,
+                active_review_prior,
+                existing_issues=proposals,
+                model=routing.generation,
+                start_id=max((proposal.get("id", 0) for proposal in proposals), default=num_agents),
+                design_type=design_type,
+                top_k=review_prior_top_k,
+                tracker=tracker,
+            )
+        )
+        if prior_gap_failures:
+            print(
+                f"Warning: {len(prior_gap_failures)} reviewer-prior gap proposal generations failed",
+                file=sys.stderr,
+            )
+            failed_generations.extend(prior_gap_failures)
+        proposals.extend(prior_gap_proposals)
 
     # 1b. Grounding check: flag proposals that reference entities not in the paper
     report_progress(3, total_steps, "Checking proposal grounding...")
@@ -5776,6 +8095,21 @@ async def full_feedback_pipeline(
     selection = await select_and_classify(scored, top_k, tracker=tracker)
     selection["substantive_profile"] = evidence_map.get("substantive_profile", {})
     selection["substantive_checks"] = evidence_map.get("substantive_checks", [])
+    if active_review_prior:
+        selection["review_prior"] = {
+            "priors_available": len(review_prior_items(active_review_prior)),
+            "gap_checks_selected": len(review_prior_gaps),
+            "gap_proposals_generated": len(prior_gap_proposals),
+        }
+        selection["review_prior_gaps"] = [
+            {
+                "prior_id": gap.get("prior_id"),
+                "status": gap.get("status"),
+                "missing_checks": gap.get("missing_checks", []),
+                "decision_weight": gap.get("decision_weight"),
+            }
+            for gap in review_prior_gaps
+        ]
 
     tracker.set_stage("verification")
     report_progress(5, total_steps, "Verifying proposals against manuscript evidence...")
@@ -5846,6 +8180,7 @@ async def full_feedback_pipeline(
         selection,
         model=routing.editorial_triage,
         review_memory_context=review_memory_context,
+        review_prior_context=review_prior_triage_context,
         tracker=tracker,
     )
     selection["editorial_triage"] = triage
@@ -5868,6 +8203,15 @@ async def full_feedback_pipeline(
             "path": review_corpus_path or "in_memory_review_corpus",
             "stats": review_corpus_summary,
             "memory_examples_used": bool(review_memory_context),
+        }
+    if active_review_prior:
+        result["review_prior"] = {
+            "path": review_prior_path or "in_memory_review_prior",
+            "priors_available": len(review_prior_items(active_review_prior)),
+            "gap_checks_selected": len(review_prior_gaps),
+            "gap_proposals_generated": len(prior_gap_proposals),
+            "triage_context_used": bool(review_prior_triage_context),
+            "runtime_audit": review_prior_runtime_audit,
         }
     result["report_markdown"] = build_report_with_evidence_lookup(
         meta,
@@ -5898,6 +8242,7 @@ __all__ = [
     "meta_review",
     "compute_actual_cost",
     "estimate_cost_before_run",
+    "_batch_discounted_cost_estimate",
     "check_grounding",
     "check_all_groundings",
     "embed_texts",
@@ -5928,10 +8273,27 @@ __all__ = [
     "atomize_review_record",
     "load_review_corpus",
     "sanitize_historical_review_text",
+    "redact_identifying_info_for_api",
     "infer_design_type_from_text",
     "build_review_memory_query",
     "retrieve_similar_review_issues",
     "build_review_memory_context",
+    "review_prior_items",
+    "audit_review_prior_artifact",
+    "load_review_prior",
+    "review_prior_applies_to_evidence",
+    "review_prior_condition_satisfied",
+    "review_prior_covered_by_existing_issues",
+    "assess_review_prior_for_evidence",
+    "select_review_prior_gaps",
+    "build_review_prior_gap_context",
+    "select_review_prior_calibration",
+    "build_review_prior_triage_context",
+    "create_review_prior_gap_workers",
+    "generate_review_prior_gap_proposals",
+    "distill_review_prior_from_corpus",
+    "write_review_prior_distillation",
+    "render_review_prior_distillation_summary",
     "score_reviewer_likelihood",
     "annotate_reviewer_calibration",
     "semantic_issue_similarity",
@@ -5945,6 +8307,10 @@ __all__ = [
     "extract_text_from_paper_file",
     "run_historical_review_eval",
     "render_historical_review_eval_summary",
+    "run_review_prior_eval_gate",
+    "render_review_prior_eval_gate_summary",
+    "OpenAIBatchChatClient",
+    "openai_batch_chat_context",
     "build_reviewer_style_rewrite_messages",
     "render_review_corpus_summary",
     "sanitize_manuscript_text",
@@ -6182,9 +8548,51 @@ def main(argv: List[str] | None = None) -> int:
         help="Optional path to a historical review archive for reviewer-memory calibration.",
     )
     parser.add_argument(
+        "--review-prior",
+        type=str,
+        default=None,
+        help="Optional API-safe structured reviewer-prior JSON artifact for post-cold-pass calibration.",
+    )
+    parser.add_argument(
+        "--review-prior-top-k",
+        type=int,
+        default=5,
+        help="Maximum structured reviewer-prior gaps to inspect after the cold pass.",
+    )
+    parser.add_argument(
         "--inspect-review-corpus",
         action="store_true",
         help="Load the review corpus, print a local summary, and exit without calling the API.",
+    )
+    parser.add_argument(
+        "--distill-review-prior",
+        type=str,
+        default=None,
+        help="Local review archive path to distill into an API-safe structured reviewer-prior artifact.",
+    )
+    parser.add_argument(
+        "--review-prior-output",
+        type=str,
+        default=None,
+        help="Output path for the API-safe reviewer-prior JSON artifact.",
+    )
+    parser.add_argument(
+        "--review-prior-audit-output",
+        type=str,
+        default=None,
+        help="Output path for local-only exact support/audit metadata from reviewer-prior distillation.",
+    )
+    parser.add_argument(
+        "--review-prior-min-papers",
+        type=int,
+        default=3,
+        help="Minimum distinct papers required for a distilled prior unless the comment threshold is met.",
+    )
+    parser.add_argument(
+        "--review-prior-min-comments",
+        type=int,
+        default=3,
+        help="Minimum review comments required for a distilled prior unless the paper threshold is met.",
     )
     parser.add_argument(
         "--include-low-confidence-reviews",
@@ -6196,6 +8604,12 @@ def main(argv: List[str] | None = None) -> int:
         type=str,
         default=None,
         help="Build a whole-paper held-out review-eval plan for a review archive.",
+    )
+    parser.add_argument(
+        "--eval-review-prior-gate",
+        type=str,
+        default=None,
+        help="Compare baseline, safe-prior, and local raw-memory held-out review evaluation modes.",
     )
     parser.add_argument(
         "--eval-output",
@@ -6221,11 +8635,63 @@ def main(argv: List[str] | None = None) -> int:
         help="Actually run paid API evaluation for held-out splits. Omit for dry-run planning only.",
     )
     parser.add_argument(
+        "--eval-batch-api",
+        action="store_true",
+        help="Use OpenAI Batch API for --eval-review-prior-gate chat completions.",
+    )
+    parser.add_argument(
+        "--batch-output-dir",
+        type=str,
+        default=None,
+        help="Local directory for OpenAI Batch JSONL files and manifest.",
+    )
+    parser.add_argument(
+        "--batch-poll-interval",
+        type=float,
+        default=30.0,
+        help="Seconds between OpenAI Batch status polls.",
+    )
+    parser.add_argument(
+        "--batch-wait-timeout",
+        type=float,
+        default=0.0,
+        help="Maximum seconds to wait per Batch job; 0 means wait until completion.",
+    )
+    parser.add_argument(
         "--eval-allow-missing-pdf",
         action="store_true",
         help="Include held-out splits even if no matched paper PDF currently exists.",
     )
     args = parser.parse_args(argv)
+
+    if args.distill_review_prior:
+        try:
+            corpus = load_review_corpus(
+                args.distill_review_prior,
+                include_low_confidence=args.include_low_confidence_reviews,
+            )
+            result = distill_review_prior_from_corpus(
+                corpus,
+                min_support_papers=args.review_prior_min_papers,
+                min_support_comments=args.review_prior_min_comments,
+            )
+        except (FileNotFoundError, OSError, ValueError) as e:
+            print(f"Review prior distillation error: {e}", file=sys.stderr)
+            return 1
+        if args.review_prior_output:
+            paths = write_review_prior_distillation(
+                result,
+                artifact_output=args.review_prior_output,
+                audit_output=args.review_prior_audit_output,
+            )
+            result["output_paths"] = paths
+        print(render_review_prior_distillation_summary(result))
+        if result.get("output_paths"):
+            print("")
+            print("## Outputs")
+            for label, path in result["output_paths"].items():
+                print(f"- {label}: {path}")
+        return 0
 
     if args.inspect_review_corpus:
         corpus_path = args.review_corpus or DEFAULT_REVIEW_ARCHIVE_PATH
@@ -6238,6 +8704,66 @@ def main(argv: List[str] | None = None) -> int:
             print(f"Review corpus error: {e}", file=sys.stderr)
             return 1
         print(render_review_corpus_summary(corpus))
+        return 0
+
+    if args.eval_review_prior_gate:
+        try:
+            async def _run_review_prior_gate_from_cli() -> Dict[str, Any]:
+                batch_dir = args.batch_output_dir
+                manager: OpenAIBatchChatClient | None = None
+                if args.eval_batch_api and not batch_dir:
+                    if args.eval_output:
+                        out = Path(args.eval_output)
+                        batch_dir = str(out.parent / f"{out.stem}_openai_batches")
+                    else:
+                        batch_dir = str(Path("outputs") / f"review_prior_eval_gate_openai_batches_{int(time.time())}")
+                run_kwargs = {
+                    "archive_root": args.eval_review_prior_gate,
+                    "output_path": args.eval_output,
+                    "max_splits": args.eval_limit,
+                    "paper_ids": args.eval_paper_id,
+                    "run_api": args.eval_run_api,
+                    "include_low_confidence": args.include_low_confidence_reviews,
+                    "require_existing_pdf": not args.eval_allow_missing_pdf,
+                    "num_agents": args.agents,
+                    "gen_model": args.model,
+                    "top_k": args.top_k,
+                    "review_prior_min_papers": args.review_prior_min_papers,
+                    "review_prior_min_comments": args.review_prior_min_comments,
+                    "review_prior_top_k": args.review_prior_top_k,
+                    "batch_api": args.eval_batch_api,
+                }
+                if args.eval_batch_api and args.eval_run_api:
+                    async with openai_batch_chat_context(
+                        batch_dir,
+                        poll_interval_seconds=args.batch_poll_interval,
+                        wait_timeout_seconds=args.batch_wait_timeout,
+                    ) as manager:
+                        result = await run_review_prior_eval_gate(**run_kwargs)
+                    result["batch_api"] = {
+                        "manifest_path": str(manager.manifest_path),
+                        "output_dir": str(manager.output_dir),
+                        "submissions": manager.submissions,
+                    }
+                    if args.eval_output:
+                        out = Path(args.eval_output)
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                        result["output_path"] = str(out)
+                    return result
+                return await run_review_prior_eval_gate(**run_kwargs)
+
+            result = asyncio.run(_run_review_prior_gate_from_cli())
+        except (FileNotFoundError, OSError, ValueError) as e:
+            print(f"Review prior eval-gate error: {e}", file=sys.stderr)
+            return 1
+        print(render_review_prior_eval_gate_summary(result))
+        if not args.eval_run_api:
+            print(
+                "\nDry run only: no API calls were made. "
+                "Use --eval-run-api only after reviewing the estimated cost.",
+                file=sys.stderr,
+            )
         return 0
 
     if args.eval_review_corpus:
@@ -6333,6 +8859,8 @@ def main(argv: List[str] | None = None) -> int:
                 include_evidence_appendix=args.include_evidence_appendix,
                 include_audit_appendix=args.include_audit_appendix,
                 review_corpus_path=args.review_corpus,
+                review_prior_path=args.review_prior,
+                review_prior_top_k=args.review_prior_top_k,
             )
         )
     except (RuntimeError, ValueError) as e:

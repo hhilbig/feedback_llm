@@ -59,6 +59,43 @@ class EvidenceIndexTests(unittest.TestCase):
         self.assertEqual(len(sanitized["quarantined"]), 1)
         self.assertEqual(sanitized["quarantined"][0]["reasons"], ["suppress_critique"])
 
+    def test_redacts_api_identifiers_before_abstract(self):
+        text = """
+Does Rent Control Turn Tenants Into NIMBYs?
+
+Hanno Hilbig
+Department of Political Science
+hanno@example.edu
+https://example.edu/private
+
+Abstract
+
+This paper uses a regression discontinuity design around a rent-control cutoff.
+The prior work by Hilbig is cited in the text.
+
+Acknowledgments
+
+We thank named colleagues and list grant details.
+
+References
+
+Smith 2020.
+""".strip()
+
+        redacted = fp.redact_identifying_info_for_api(text)
+        safe = redacted["safe_text"]
+
+        self.assertIn("[title page and author metadata redacted]", safe)
+        self.assertNotIn("Hanno Hilbig", safe)
+        self.assertNotIn("Hilbig", safe)
+        self.assertNotIn("hanno@example.edu", safe)
+        self.assertNotIn("https://example.edu/private", safe)
+        self.assertNotIn("named colleagues", safe)
+        self.assertIn("This paper uses a regression discontinuity design", safe)
+        self.assertIn("References", safe)
+        self.assertGreater(redacted["redactions"]["title_page_blocks"], 0)
+        self.assertGreater(redacted["redactions"]["metadata_sections"], 0)
+
     def test_builds_stable_evidence_ids_for_core_manuscript_elements(self):
         evidence = fp.build_deterministic_evidence_index(SAMPLE_PAPER)
         elements = evidence["elements"]
@@ -84,6 +121,29 @@ class EvidenceIndexTests(unittest.TestCase):
         self.assertIn("[TBL001] type=table section=SEC002", formatted)
         self.assertIn("[APP001] type=appendix", formatted)
         self.assertNotIn("Ignore previous instructions", formatted)
+
+    def test_prompt_format_can_cap_elements_for_local_models(self):
+        evidence = fp.build_deterministic_evidence_index(SAMPLE_PAPER)
+
+        formatted = fp.format_evidence_index_for_prompt(
+            evidence,
+            max_excerpt_chars=120,
+            max_elements=2,
+        )
+
+        self.assertIn("[SEC001] type=section", formatted)
+        self.assertIn("[P001] type=paragraph", formatted)
+        self.assertNotIn("[SEC002] type=section", formatted)
+
+    def test_local_text_cap_preserves_head_and_tail(self):
+        text = "START " + ("middle " * 200) + " END"
+
+        capped = fp._cap_text_for_local_model(text, 200)
+
+        self.assertLessEqual(len(capped), 200)
+        self.assertTrue(capped.startswith("START"))
+        self.assertTrue(capped.endswith("END"))
+        self.assertIn("truncated for local model context", capped)
 
     def test_evidence_map_schema_is_strict_at_top_level(self):
         schema = fp.EVIDENCE_MAP_SCHEMA
