@@ -9,10 +9,17 @@ pseudonymous aggregate results outside the private corpus directory. Reviewer
 prompts, model routing, reasoning settings, thresholds, and report synthesis
 have not changed in this milestone.
 
-The five-family source freeze is not yet complete. Two cases are materialized
-and hash-verified locally. The exact CA Insurance, German elections, and DDR
-submission bundles are still cloud-only Dropbox placeholders, so the importer
-correctly rejects them before cost estimation.
+The five-family source freeze is complete. All manuscript and feedback files
+are materialized, copied into the private corpus, and hash-verified. The offline
+import produces 12 human-review records, 150 issue candidates, and 145 clusters.
+The gold-adjudication packet is ready but has not been reviewed by a human.
+
+The cold-baseline dry run estimated a total API cost of $9.7836 and made no API
+calls. This estimate exceeds the previously discussed $2--$3 range, so no paid
+run is authorized. The German AJPS source required one additional safeguard:
+only verbatim reviewer passages were transcribed from the response memo. Author
+responses and the merged resubmission remain hash-bound deferred sources and
+are not evaluation targets.
 
 ## Implemented
 
@@ -44,24 +51,20 @@ correctly rejects them before cost estimation.
 | Family | Current status | Pilot treatment |
 |---|---|---|
 | Great Recession | Ready: exact annotated manuscript, 59 nonempty annotations | Primary |
-| CA Insurance | Blocked: exact submission and raw reports are cloud-only | Primary, journal |
-| German elections | Blocked: exact initial submission, appendix, and review packet are cloud-only | Primary, journal |
-| DDR | Blocked: exact CPS manuscript, supplement, and reviews are cloud-only | Primary, journal |
+| CA Insurance | Ready: exact submission, editor report, and three raw reviewer reports | Primary, journal |
+| German elections | Ready: original manuscript and appendix plus 30 response-free, verbatim reviewer items | Primary, journal |
+| DDR | Ready: exact CPS manuscript and supplement plus nine issues from three reviewers | Primary, journal |
 | Insurers | Ready: manuscript plus human items 1–7; generated items 8–20 excluded | Secondary only |
 
 ## Next Validation Gate
 
-1. Materialize the three blocked Dropbox bundles and copy them into
-   `~/.feedback_llm/` without editing the Dropbox originals.
-2. Freeze the complete five-case manifest and verify four primary
-   manuscript-feedback pairs by hash.
-3. Regenerate the gold packet, screen every cluster, fully adjudicate every
-   major cluster, and adjudicate the deterministic minor sample.
-4. Run the zero-call cold-baseline cost estimate and obtain explicit approval
-   for the reported total.
-5. Run the paid baseline only if the completed gold packet is current and the
+1. Screen all 145 clusters in the gold packet. Complete the required fields for
+   all major clusters and the deterministic minor sample (34 full rows).
+2. Re-run the zero-call cost estimate after adjudication and obtain explicit
+   approval for the reported total. The current estimate is $9.7836.
+3. Run the paid baseline only if the completed gold packet is current and the
    estimate is below the approved ceiling.
-6. Label every generated top-five issue, then finalize the primary,
+4. Label every generated top-five issue, then finalize the primary,
    journal-only, sampled-minor, precision, novelty, duplicate, and cost metrics.
 
 Do not change reviewer prompts, models, routing, reasoning effort, thresholds,
