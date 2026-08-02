@@ -45,7 +45,8 @@ and can be refined later.
 
 
 MODEL_REGISTRY = {
-    # Current model family, verified against OpenAI docs on 2026-07-13.
+    # Current model family and standard short-context prices, verified against
+    # OpenAI docs on 2026-08-02.
     "gpt-5.6-sol": {
         "input": 5.00 / 1e6,
         "output": 30.00 / 1e6,
@@ -54,16 +55,16 @@ MODEL_REGISTRY = {
         "current": True,
     },
     "gpt-5.6-terra": {
-        "input": 2.50 / 1e6,
-        "output": 15.00 / 1e6,
-        "cached_input": 0.25 / 1e6,
+        "input": 2.00 / 1e6,
+        "output": 12.00 / 1e6,
+        "cached_input": 0.20 / 1e6,
         "label": "Balanced default for substantive review stages",
         "current": True,
     },
     "gpt-5.6-luna": {
-        "input": 1.00 / 1e6,
-        "output": 6.00 / 1e6,
-        "cached_input": 0.10 / 1e6,
+        "input": 0.20 / 1e6,
+        "output": 1.20 / 1e6,
+        "cached_input": 0.02 / 1e6,
         "label": "Efficient model for simple structured tasks",
         "current": True,
     },

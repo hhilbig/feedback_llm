@@ -1,10 +1,11 @@
 # feedback_llm Status
 
-## Current Focus
+## Current State
 
-Implement a privacy-preserving reviewer-prior distillation layer. Raw reviews and
-matched paper-review pairings stay local. API-facing runs should use only a
-versioned, audited, structured reviewer-prior artifact.
+The privacy-preserving reviewer-prior distillation layer is implemented. Raw
+reviews and matched paper-review pairings stay local. API-facing runs use only a
+versioned, audited, structured reviewer-prior artifact. There is no active
+feature implementation milestone.
 
 ## Implementation Stages
 
@@ -18,6 +19,12 @@ versioned, audited, structured reviewer-prior artifact.
    decision tier, but cannot affect manuscript support or verification.
 5. Done: held-out evaluation gate comparing baseline, safe prior, local
    raw-memory upper bound, and human issue clusters.
+
+## Next Validation Gate
+
+Run representative evaluations before changing model routing, reasoning effort,
+or prompts. Accept a behavioral change only when those evaluations show a clear
+quality, cost, or latency improvement.
 
 ## Guardrails
 

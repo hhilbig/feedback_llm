@@ -73,6 +73,20 @@ class StructuredOutputTests(unittest.TestCase):
 
 
 class CostEstimateTests(unittest.TestCase):
+    def test_current_model_pricing_matches_official_standard_rates(self):
+        expected_per_million = {
+            "gpt-5.6-sol": {"input": 5.00, "cached_input": 0.50, "output": 30.00},
+            "gpt-5.6-terra": {"input": 2.00, "cached_input": 0.20, "output": 12.00},
+            "gpt-5.6-luna": {"input": 0.20, "cached_input": 0.02, "output": 1.20},
+        }
+
+        for model, expected in expected_per_million.items():
+            with self.subTest(model=model):
+                actual = fp.MODEL_PRICING[model]
+                self.assertEqual(actual["input"] * 1e6, expected["input"])
+                self.assertEqual(actual["cached_input"] * 1e6, expected["cached_input"])
+                self.assertEqual(actual["output"] * 1e6, expected["output"])
+
     def test_estimate_uses_routing_models_without_api_key(self):
         with patch.dict(os.environ, {}, clear=True):
             estimate = fp.estimate_cost_before_run(

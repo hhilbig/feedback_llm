@@ -13,6 +13,7 @@ venv/
 # User input files
 paper.txt
 reports/
+outputs/
 
 # Private review-memory/evaluation artifacts
 journal_reviews_inbox*/
