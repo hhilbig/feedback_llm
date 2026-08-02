@@ -1,9 +1,12 @@
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
+import subprocess
 import sys
+import tempfile
 import time
 from argparse import ArgumentParser
 from collections import Counter, defaultdict
@@ -255,6 +258,18 @@ class ReviewIssue:
     matched_paper_files: Tuple[str, ...] = ()
     match_status: str = ""
     quality_flag: str = "use"
+    family_id: str = ""
+    case_id: str = ""
+    source_id: str = ""
+    source_locator: str = ""
+    anchor_text: str = ""
+    benchmark_tier: str = ""
+    disposition: str = "evaluation"
+    source_hash: str = ""
+    manuscript_hash: str = ""
+    match_confidence: str = ""
+    cluster_id: str = ""
+    adjudication_status: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         data = self.__dict__.copy()
@@ -823,10 +838,50 @@ def load_review_corpus(
     archive_root: str | Path = DEFAULT_REVIEW_ARCHIVE_PATH,
     include_low_confidence: bool = False,
 ) -> Dict[str, Any]:
-    """Load archived review markdown, paper matches, and atomized issues."""
-    root = Path(archive_root)
+    """Load a legacy archive directory or a validated private manifest/snapshot."""
+    root = Path(archive_root).expanduser()
     if not root.exists():
         raise FileNotFoundError(f"Review archive not found: {root}")
+    if root.is_file():
+        from review_corpus_manifest import (
+            ManifestValidationError,
+            build_review_corpus_from_manifest,
+            is_normalized_review_corpus,
+            is_review_manifest,
+            reseal_normalized_corpus,
+        )
+
+        manifest_input = is_review_manifest(root)
+        normalized_input = is_normalized_review_corpus(root)
+        if not (manifest_input or normalized_input):
+            raise ManifestValidationError(
+                "review-corpus JSON is neither a manifest v1 nor a normalized private snapshot"
+            )
+        corpus = build_review_corpus_from_manifest(root)
+        if manifest_input:
+            for issue in corpus.get("issues", []):
+                text = issue.get("issue_text", "")
+                if issue.get("issue_type") in {"", "unclassified"}:
+                    issue["issue_type"] = infer_issue_type(text)
+                if issue.get("decision_tier") in {"", "unadjudicated"}:
+                    issue["decision_tier"] = infer_decision_tier(
+                        text,
+                        issue.get("decision", ""),
+                        issue.get("reviewer_id", ""),
+                    )
+                if not issue.get("action_requested"):
+                    issue["action_requested"] = infer_action_requested(text)
+                if not issue.get("tone"):
+                    issue["tone"] = infer_tone(text)
+                if not issue.get("paper_section"):
+                    issue["paper_section"] = infer_paper_section(text)
+                if not issue.get("reviewer_confidence"):
+                    issue["reviewer_confidence"] = infer_reviewer_confidence(text)
+                if issue.get("design_type") in {"", "unclear"}:
+                    issue["design_type"] = infer_design_type_from_text(text)
+            corpus = reseal_normalized_corpus(corpus)
+        return corpus
+
     paper_matches = parse_paper_matches(root / "papers" / "PAPER_MATCHES.md", archive_root=root)
     raw_exports = load_raw_review_exports(root)
     records: List[Dict[str, Any]] = []
@@ -2911,22 +2966,42 @@ def _review_corpus_stats(
 def filter_review_corpus_for_holdout(
     corpus: Dict[str, Any],
     heldout_paper_id: str,
+    heldout_family_id: str | None = None,
 ) -> Dict[str, Any]:
-    """Return a training corpus that excludes all records/issues for one paper."""
+    """Return a corpus excluding every record in the held-out manuscript family.
+
+    Legacy corpora do not define ``family_id``. For those inputs the historical
+    paper-ID behavior remains the fallback.
+    """
+    if heldout_family_id is None:
+        heldout_family_id = next(
+            (
+                str(record.get("family_id", ""))
+                for record in corpus.get("records", [])
+                if record.get("paper_id") == heldout_paper_id and record.get("family_id")
+            ),
+            "",
+        )
+
+    def is_heldout(item: Dict[str, Any]) -> bool:
+        if heldout_family_id and item.get("family_id"):
+            return item.get("family_id") == heldout_family_id
+        return item.get("paper_id") == heldout_paper_id
+
     heldout_review_files = {
         record.get("review_file", "")
         for record in corpus.get("records", [])
-        if record.get("paper_id") == heldout_paper_id
+        if is_heldout(record)
     }
     train_records = [
         record
         for record in corpus.get("records", [])
-        if record.get("paper_id") != heldout_paper_id
+        if not is_heldout(record)
     ]
     train_issues = [
         issue
         for issue in corpus.get("issues", [])
-        if issue.get("paper_id") != heldout_paper_id
+        if not is_heldout(issue)
     ]
     train_matches = {
         review_file: match
@@ -2936,8 +3011,10 @@ def filter_review_corpus_for_holdout(
     low_confidence_excluded = list(corpus.get("excluded_records", []))
     excluded_records = low_confidence_excluded + sorted(heldout_review_files)
     stats = _review_corpus_stats(train_records, train_issues, low_confidence_excluded)
-    stats["heldout_records"] = len(heldout_review_files)
-    return {
+    stats["heldout_records"] = sum(
+        1 for record in corpus.get("records", []) if is_heldout(record)
+    )
+    filtered = {
         "archive_root": corpus.get("archive_root", ""),
         "records": train_records,
         "issues": train_issues,
@@ -2945,39 +3022,87 @@ def filter_review_corpus_for_holdout(
         "stats": stats,
         "excluded_records": excluded_records,
         "holdout_paper_id": heldout_paper_id,
+        "holdout_family_id": heldout_family_id or heldout_paper_id,
     }
+    for key in [
+        "corpus_id",
+        "manifest_version",
+        "importer_version",
+        "corpus_fingerprint",
+        "binding_hash",
+    ]:
+        if key in corpus:
+            filtered[key] = corpus[key]
+    return filtered
 
 
 def _group_records_by_paper(corpus: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     grouped: Dict[str, Dict[str, Any]] = {}
     issues_by_paper: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for issue in corpus.get("issues", []):
-        issues_by_paper[issue.get("paper_id", "")].append(issue)
+        issue_key = issue.get("case_id") or issue.get("paper_id", "")
+        issues_by_paper[issue_key].append(issue)
+        if issue.get("paper_id") and issue.get("paper_id") != issue_key:
+            issues_by_paper[issue.get("paper_id", "")].append(issue)
 
     for record in corpus.get("records", []):
         paper_id = record.get("paper_id")
         if not paper_id:
             continue
+        family_id = record.get("family_id") or paper_id
         item = grouped.setdefault(
             paper_id,
             {
                 "paper_id": paper_id,
+                "family_id": family_id,
+                "case_id": record.get("case_id", ""),
                 "review_files": [],
                 "journals": set(),
                 "decisions": set(),
                 "matched_paper_files": set(),
+                "manuscript_files": [],
+                "benchmark_tier": record.get("benchmark_tier", ""),
+                "classification": record.get("classification", ""),
+                "source_types": set(),
+                "dispositions": set(),
+                "manifest_case": bool(record.get("manifest_case")),
             },
         )
+        if item.get("family_id") != family_id:
+            raise ValueError(
+                f"Paper ID {paper_id!r} maps to multiple manuscript families"
+            )
         item["review_files"].append(record.get("review_file", ""))
         if record.get("journal"):
             item["journals"].add(record.get("journal"))
         if record.get("decision"):
             item["decisions"].add(record.get("decision"))
         item["matched_paper_files"].update(record.get("matched_paper_files", []))
+        for manuscript_file in record.get("manuscript_files", []):
+            if manuscript_file not in item["manuscript_files"]:
+                item["manuscript_files"].append(manuscript_file)
+        if record.get("source_type"):
+            item["source_types"].add(record.get("source_type"))
+        if record.get("disposition"):
+            item["dispositions"].add(record.get("disposition"))
 
     for paper_id, item in grouped.items():
         human_issue_candidates = issues_by_paper.get(paper_id, [])
-        human_issues, excluded_human_issues = filter_human_review_target_issues(human_issue_candidates)
+        if item.get("manifest_case"):
+            human_issues = [
+                issue
+                for issue in human_issue_candidates
+                if issue.get("disposition", "evaluation") == "evaluation"
+            ]
+            excluded_human_issues = [
+                issue
+                for issue in human_issue_candidates
+                if issue.get("disposition", "evaluation") != "evaluation"
+            ]
+        else:
+            human_issues, excluded_human_issues = filter_human_review_target_issues(
+                human_issue_candidates
+            )
         human_clusters = cluster_human_review_issues(human_issues)
         item["human_issue_candidate_count"] = len(human_issue_candidates)
         item["human_issue_count"] = len(human_issues)
@@ -2998,6 +3123,8 @@ def _group_records_by_paper(corpus: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
         item["journals"] = sorted(item["journals"])
         item["decisions"] = sorted(item["decisions"])
         item["matched_paper_files"] = sorted(item["matched_paper_files"])
+        item["source_types"] = sorted(item["source_types"])
+        item["dispositions"] = sorted(item["dispositions"])
         item["existing_paper_files"] = [
             path for path in item["matched_paper_files"] if Path(path).exists()
         ]
@@ -3021,11 +3148,17 @@ def build_review_holdout_splits(
     for paper_id, item in sorted(grouped.items(), key=lambda pair: pair[0]):
         if requested and paper_id not in requested:
             continue
+        if item.get("manifest_case") and "evaluation" not in item.get("dispositions", []):
+            continue
         if item.get("human_issue_count", 0) == 0:
             continue
         if require_existing_pdf and not item.get("existing_paper_files"):
             continue
-        train_corpus = filter_review_corpus_for_holdout(corpus, paper_id)
+        train_corpus = filter_review_corpus_for_holdout(
+            corpus,
+            paper_id,
+            heldout_family_id=item.get("family_id"),
+        )
         split = {
             **item,
             "train_record_count": train_corpus["stats"]["records"],
@@ -3079,18 +3212,175 @@ def _extract_first_holdout_paper_text(split: Dict[str, Any]) -> Tuple[str, str, 
     return "", "no_matched_paper_file", ""
 
 
-def _generated_issues_for_eval(pipeline_result: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_holdout_manuscript_bundle(
+    split: Dict[str, Any],
+) -> Tuple[str, str, List[str]]:
+    """Extract an ordered manifest manuscript bundle, or one legacy paper file."""
+    manuscript_files = [
+        str(path) for path in split.get("manuscript_files", []) if str(path).strip()
+    ]
+    if not split.get("manifest_case") or not manuscript_files:
+        text, status, paper_file = _extract_first_holdout_paper_text(split)
+        return text, status, [paper_file] if paper_file else []
+
+    texts: List[str] = []
+    used_files: List[str] = []
+    errors: List[str] = []
+    for index, manuscript_file in enumerate(manuscript_files, start=1):
+        text, status = extract_text_from_paper_file(manuscript_file)
+        if not text.strip():
+            errors.append(f"{Path(manuscript_file).name}:{status}")
+            continue
+        used_files.append(manuscript_file)
+        texts.append(
+            f"[MANUSCRIPT FILE {index}]\n\n{text.strip()}"
+        )
+    if errors:
+        return "", "bundle_extract_error:" + ";".join(errors), used_files
+    if not texts:
+        return "", "no_extractable_manuscript_files", []
+    return "\n\n".join(texts), "ok", used_files
+
+
+def _generated_issues_for_eval(
+    pipeline_result: Dict[str, Any],
+    top_k: int = 5,
+) -> List[Dict[str, Any]]:
+    """Return the final post-verification top-K proposals used in the report."""
     selection = pipeline_result.get("selection", {})
+    if isinstance(selection.get("top_proposals"), list):
+        return selection["top_proposals"][:top_k]
     if selection.get("high_quality"):
-        return selection["high_quality"]
+        return selection["high_quality"][:top_k]
     if pipeline_result.get("scored"):
-        return pipeline_result["scored"]
+        return pipeline_result["scored"][:top_k]
     if pipeline_result.get("proposals"):
-        return pipeline_result["proposals"]
+        return pipeline_result["proposals"][:top_k]
     return []
 
 
 REVIEW_PRIOR_EVAL_MODES = ("baseline", "safe_prior", "local_raw_memory")
+REVIEW_BASELINE_TOP_K = 5
+REVIEW_BASELINE_EXPECTED_CASES = 5
+
+
+def _require_positive_finite_cost_ceiling(
+    value: float | None,
+    *,
+    label: str,
+) -> float:
+    """Validate a paid-evaluation ceiling before any API work is possible."""
+    if value is None:
+        raise ValueError(f"{label} requires a positive finite max_cost_usd")
+    numeric = float(value)
+    if not math.isfinite(numeric) or numeric <= 0:
+        raise ValueError(f"{label} requires a positive finite max_cost_usd")
+    return numeric
+
+
+def _case_set_hash(rows: List[Dict[str, str]]) -> str:
+    normalized = sorted(
+        {
+            (
+                str(row.get("family_id", "")),
+                str(row.get("case_id", "")),
+            )
+            for row in rows
+        }
+    )
+    payload = json.dumps(normalized, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _manifest_expected_eval_cases(corpus: Dict[str, Any]) -> List[Dict[str, str]]:
+    cases: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for record in corpus.get("records", []):
+        if not record.get("manifest_case"):
+            continue
+        if str(record.get("disposition", "evaluation")) != "evaluation":
+            continue
+        family_id = str(record.get("family_id") or record.get("paper_id") or "")
+        case_id = str(record.get("case_id") or record.get("paper_id") or "")
+        if family_id and case_id:
+            cases[(family_id, case_id)] = {
+                "family_id": family_id,
+                "case_id": case_id,
+            }
+    return [cases[key] for key in sorted(cases)]
+
+
+def _manifest_benchmark_binding(
+    corpus: Dict[str, Any],
+    splits: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    expected = _manifest_expected_eval_cases(corpus)
+    selected = [
+        {
+            "family_id": str(split.get("family_id") or split.get("paper_id") or ""),
+            "case_id": str(split.get("case_id") or split.get("paper_id") or ""),
+        }
+        for split in splits
+    ]
+    return {
+        "expected_case_count": len(expected),
+        "expected_family_count": len({row["family_id"] for row in expected}),
+        "expected_case_set_hash": _case_set_hash(expected),
+        "selected_case_count": len(selected),
+        "selected_family_count": len({row["family_id"] for row in selected}),
+        "selected_case_set_hash": _case_set_hash(selected),
+    }
+
+
+def _split_is_journal_case(split: Dict[str, Any]) -> bool:
+    if split.get("journals"):
+        return True
+    labels = " ".join(
+        [
+            str(split.get("classification", "")),
+            *[str(value) for value in split.get("source_types", [])],
+        ]
+    ).casefold()
+    return "journal" in labels
+
+
+def _manifest_pilot_structure_errors(
+    corpus: Dict[str, Any],
+    splits: List[Dict[str, Any]],
+) -> List[str]:
+    """Validate the fixed five-family pilot before any paid manuscript call."""
+    errors: List[str] = []
+    expected = _manifest_expected_eval_cases(corpus)
+    selected = [
+        {
+            "family_id": str(split.get("family_id") or split.get("paper_id") or ""),
+            "case_id": str(split.get("case_id") or split.get("paper_id") or ""),
+        }
+        for split in splits
+    ]
+    if len(expected) != REVIEW_BASELINE_EXPECTED_CASES:
+        errors.append(
+            "pilot manifest must contain exactly five evaluation cases "
+            f"(found {len(expected)})"
+        )
+    if len({row["family_id"] for row in expected}) != REVIEW_BASELINE_EXPECTED_CASES:
+        errors.append("pilot manifest must contain exactly five evaluation families")
+    if len(selected) != len({(row["family_id"], row["case_id"]) for row in selected}):
+        errors.append("selected pilot contains duplicate case rows")
+    if _case_set_hash(selected) != _case_set_hash(expected):
+        errors.append("selected pilot is not the complete five-case manifest")
+
+    primary = [split for split in splits if split.get("benchmark_tier") == "primary"]
+    secondary = [split for split in splits if split.get("benchmark_tier") == "secondary"]
+    other_tiers = [
+        split
+        for split in splits
+        if split.get("benchmark_tier") not in {"primary", "secondary"}
+    ]
+    if len(primary) != 4 or len(secondary) != 1 or other_tiers:
+        errors.append("pilot composition must be exactly four primary and one secondary case")
+    if sum(1 for split in primary if _split_is_journal_case(split)) != 3:
+        errors.append("pilot composition must contain exactly three primary journal cases")
+    return errors
 
 
 def _generated_issue_quality_summary(generated: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -3222,6 +3512,449 @@ def _batch_discounted_cost_estimate(cost: Dict[str, Any]) -> float:
     return discounted
 
 
+def _manifest_evaluation_issues(corpus: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # Manifest selectors already define the eligible human-feedback material.
+    # Keep every imported evaluation issue in the gold tier screen so a short
+    # or stylistically unusual major concern cannot be removed by heuristics
+    # before a human sees it.
+    return [
+        issue
+        for issue in corpus.get("issues", [])
+        if issue.get("disposition", "evaluation") == "evaluation"
+    ]
+
+
+def _adjudication_binding_context(corpus: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "corpus_binding_hash": _corpus_binding_hash(corpus),
+        "manifest_version": corpus.get("manifest_version", ""),
+        "importer_version": corpus.get("importer_version", ""),
+    }
+
+
+def prepare_review_adjudication(
+    corpus_path: str | Path,
+    output_dir: str | Path,
+) -> Dict[str, Any]:
+    """Create the private, hash-bound human-feedback adjudication packet."""
+    corpus = load_review_corpus(corpus_path)
+    if not corpus.get("manifest_version"):
+        raise ValueError("Gold adjudication packets require a manifest corpus")
+    issues = _manifest_evaluation_issues(corpus)
+    from review_adjudication import write_gold_adjudication_packet
+
+    packet = write_gold_adjudication_packet(
+        issues,
+        output_dir,
+        binding_context=_adjudication_binding_context(corpus),
+        clusterer=cluster_human_review_issues,
+    )
+    packet["corpus_binding_hash"] = _corpus_binding_hash(corpus)
+    packet["issue_count"] = len(issues)
+    return packet
+
+
+def _load_current_gold_adjudication(
+    corpus: Dict[str, Any],
+    adjudication_path: str | Path,
+) -> Dict[str, Any]:
+    from review_adjudication import cluster_normalized_issues, load_gold_adjudication
+
+    issues = _manifest_evaluation_issues(corpus)
+    clusters = cluster_normalized_issues(
+        issues,
+        clusterer=cluster_human_review_issues,
+    )
+    return load_gold_adjudication(
+        adjudication_path,
+        clusters=clusters,
+        binding_context=_adjudication_binding_context(corpus),
+    )
+
+
+def finalize_review_evaluation(
+    corpus_path: str | Path,
+    gold_adjudication_path: str | Path,
+    generated_adjudication_path: str | Path,
+    local_audit_path: str | Path,
+    output_path: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Validate both manual packets and compute text-free aggregate metrics."""
+    corpus = load_review_corpus(corpus_path)
+    if not corpus.get("manifest_version"):
+        raise ValueError("Final baseline metrics require a manifest corpus")
+    gold = _load_current_gold_adjudication(corpus, gold_adjudication_path)
+    audit_path = Path(local_audit_path).expanduser()
+    local_audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    audit_errors = _manifest_baseline_audit_errors(corpus, local_audit)
+    if audit_errors:
+        raise ValueError(
+            "Baseline run is incomplete or stale: " + "; ".join(audit_errors)
+        )
+    run_metadata = local_audit.get("run_metadata", {})
+    run_context = {
+        "corpus_binding_hash": _corpus_binding_hash(corpus),
+        "git_commit": run_metadata.get("git", {}).get("commit", "unknown"),
+        "routing": run_metadata.get("routing", {}),
+        "top_k": run_metadata.get("top_k", 5),
+        "memory_mode": run_metadata.get("memory_mode", "none"),
+        "benchmark_binding": run_metadata.get("benchmark_binding", {}),
+    }
+    from review_adjudication import (
+        compute_privacy_safe_metrics,
+        load_generated_adjudication,
+    )
+
+    generated = load_generated_adjudication(
+        generated_adjudication_path,
+        expected_binding_hash=local_audit.get("generated_adjudication", {}).get(
+            "binding_hash"
+        ),
+        expected_gold_binding_hash=gold.get("binding_hash"),
+        valid_gold_cluster_ids=[row.get("cluster_id", "") for row in gold.get("rows", [])],
+        run_binding_context=run_context,
+        top_k=REVIEW_BASELINE_TOP_K,
+    )
+    if generated.get("status") != "ready":
+        raise ValueError(
+            "Generated top-five adjudication is not complete and current "
+            f"(status={generated.get('status', 'missing')})"
+        )
+    expected_case_keys = {
+        (row["family_id"], row["case_id"])
+        for row in _manifest_expected_eval_cases(corpus)
+    }
+    generated_counts = Counter(
+        (
+            str(row.get("family_id", "")),
+            str(row.get("case_id", "")),
+        )
+        for row in generated.get("rows", [])
+    )
+    if set(generated_counts) != expected_case_keys or any(
+        count != REVIEW_BASELINE_TOP_K for count in generated_counts.values()
+    ):
+        raise ValueError(
+            "Generated adjudication must contain exactly five rows for each of "
+            "the five expected cases"
+        )
+    family_metadata: Dict[str, Dict[str, Any]] = {}
+    cost_by_family: Dict[str, float] = {}
+    for split in local_audit.get("splits", []):
+        family_id = str(split.get("family_id", ""))
+        if not family_id:
+            continue
+        family_metadata[family_id] = {
+            "benchmark_tier": split.get("benchmark_tier", "primary"),
+            "is_journal_case": _split_is_journal_case(split),
+        }
+        usage_cost = split.get("actual_usage", {}).get("total_cost_usd")
+        cost_by_family[family_id] = float(
+            usage_cost
+            if usage_cost is not None
+            else split.get("estimated_cost_usd", 0.0)
+        )
+    metrics = compute_privacy_safe_metrics(
+        gold,
+        generated,
+        family_metadata=family_metadata,
+        cost_by_family=cost_by_family,
+        top_k=REVIEW_BASELINE_TOP_K,
+    )
+    if metrics.get("status") != "complete":
+        raise ValueError("Final metrics remain pending human adjudication")
+    result = {
+        "status": "complete",
+        "schema_version": "portable_review_eval_metrics_v1",
+        "corpus_binding_hash": _corpus_binding_hash(corpus),
+        "run_metadata": run_metadata,
+        "metrics": metrics,
+    }
+    if output_path:
+        out = _write_private_json(output_path, result)
+        result["output_path"] = str(out)
+    return result
+
+
+def _git_run_state() -> Dict[str, Any]:
+    """Return reproducibility metadata without exposing worktree file names."""
+    cwd = Path(__file__).resolve().parent
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                cwd=cwd,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        return {"commit": commit, "dirty": dirty}
+    except (OSError, subprocess.SubprocessError):
+        return {"commit": "unknown", "dirty": None}
+
+
+def _corpus_binding_hash(corpus: Dict[str, Any]) -> str:
+    existing = corpus.get("binding_hash")
+    if existing:
+        return str(existing)
+    binding_rows = []
+    for record in corpus.get("records", []):
+        binding_rows.append(
+            {
+                "paper_id": record.get("paper_id", ""),
+                "family_id": record.get("family_id", ""),
+                "case_id": record.get("case_id", ""),
+                "source_id": record.get("source_id", ""),
+                "source_hash": record.get("source_hash", ""),
+                "manuscript_hashes": record.get("manuscript_hashes", []),
+            }
+        )
+    payload = json.dumps(binding_rows, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _review_eval_run_metadata(
+    corpus: Dict[str, Any],
+    routing: ModelRoutingConfig,
+    num_agents: int,
+    top_k: int,
+    memory_mode: str,
+    splits: List[Dict[str, Any]] | None = None,
+) -> Dict[str, Any]:
+    routing_models = dict(routing.__dict__)
+    role_counts = Counter(role for role, _ in BASE_PERSONA_DECK)
+    multiplier = num_agents // len(BASE_PERSONA_DECK) if BASE_PERSONA_DECK else 0
+    metadata = {
+        "schema_version": "cold_review_baseline_v1",
+        "git": _git_run_state(),
+        "routing": routing_models,
+        "reasoning_effort": {
+            stage: MODEL_REASONING_EFFORT.get(model, "model_default")
+            for stage, model in routing_models.items()
+        },
+        "num_agents": num_agents,
+        "reviewer_roles": {
+            role: count * multiplier for role, count in sorted(role_counts.items())
+        },
+        "top_k": top_k,
+        "importance_threshold": IMPORTANCE_THRESHOLD,
+        "composite_threshold": COMPOSITE_THRESHOLD,
+        "memory_mode": memory_mode,
+        "corpus_binding_hash": _corpus_binding_hash(corpus),
+    }
+    if corpus.get("manifest_version"):
+        metadata["benchmark_binding"] = _manifest_benchmark_binding(
+            corpus,
+            splits or [],
+        )
+    return metadata
+
+
+def _manifest_baseline_audit_errors(
+    corpus: Dict[str, Any],
+    local_audit: Dict[str, Any],
+) -> List[str]:
+    """Return reasons a private manifest run cannot be finalized as the pilot."""
+    errors = _manifest_pilot_structure_errors(
+        corpus,
+        local_audit.get("splits", []),
+    )
+    run_metadata = local_audit.get("run_metadata", {})
+    current_binding = _manifest_benchmark_binding(
+        corpus,
+        local_audit.get("splits", []),
+    )
+    recorded_binding = run_metadata.get("benchmark_binding", {})
+    if run_metadata.get("corpus_binding_hash") != _corpus_binding_hash(corpus):
+        errors.append("local audit corpus binding does not match the current corpus")
+    if int(run_metadata.get("top_k", 0) or 0) != REVIEW_BASELINE_TOP_K:
+        errors.append("manifest baseline must use top_k=5")
+    if run_metadata.get("memory_mode") != "none":
+        errors.append("manifest baseline must use memory_mode=none")
+    if current_binding["expected_case_count"] != REVIEW_BASELINE_EXPECTED_CASES:
+        errors.append(
+            "manifest baseline requires exactly five evaluation cases "
+            f"(found {current_binding['expected_case_count']})"
+        )
+    if current_binding["expected_family_count"] != REVIEW_BASELINE_EXPECTED_CASES:
+        errors.append(
+            "manifest baseline requires exactly five distinct evaluation families "
+            f"(found {current_binding['expected_family_count']})"
+        )
+    for field in (
+        "expected_case_count",
+        "expected_family_count",
+        "expected_case_set_hash",
+        "selected_case_count",
+        "selected_family_count",
+        "selected_case_set_hash",
+    ):
+        if recorded_binding.get(field) != current_binding.get(field):
+            errors.append(f"local audit benchmark binding changed: {field}")
+    if current_binding["selected_case_set_hash"] != current_binding["expected_case_set_hash"]:
+        errors.append("local audit does not contain the complete expected case set")
+    if current_binding["selected_case_count"] != REVIEW_BASELINE_EXPECTED_CASES:
+        errors.append("local audit does not contain exactly five selected cases")
+
+    expected_keys = {
+        (row["family_id"], row["case_id"])
+        for row in _manifest_expected_eval_cases(corpus)
+    }
+    split_keys: List[Tuple[str, str]] = []
+    for split in local_audit.get("splits", []):
+        key = (
+            str(split.get("family_id") or split.get("paper_id") or ""),
+            str(split.get("case_id") or split.get("paper_id") or ""),
+        )
+        split_keys.append(key)
+        if split.get("status") != "pending_human_adjudication":
+            errors.append(f"case {key!r} was not API-evaluated successfully")
+        if split.get("paper_text_status") != "ok":
+            errors.append(f"case {key!r} did not have extractable manuscript text")
+        if int(split.get("generated_issue_count", 0) or 0) != REVIEW_BASELINE_TOP_K:
+            errors.append(f"case {key!r} does not contain exactly five generated issues")
+    if len(split_keys) != len(set(split_keys)):
+        errors.append("local audit contains duplicate case rows")
+    if set(split_keys) != expected_keys:
+        errors.append("local audit split identities do not match the expected cases")
+    if int(local_audit.get("summary", {}).get("api_evaluated_splits", 0) or 0) != REVIEW_BASELINE_EXPECTED_CASES:
+        errors.append("local audit does not contain five API-evaluated splits")
+    return errors
+
+
+def _portable_paper_text_status(status: Any) -> str:
+    raw = str(status or "").lower()
+    if raw == "ok":
+        return "ok"
+    if raw.startswith("unsupported_file_type"):
+        return "unsupported"
+    if raw in {
+        "",
+        "missing_file",
+        "no_matched_paper_file",
+        "no_extractable_manuscript_files",
+    }:
+        return "unavailable"
+    if raw.startswith(("read_error", "pdf_extract_error", "bundle_extract_error")):
+        return "extract_error"
+    if raw in {"empty_pdf_text", "pymupdf_not_installed"}:
+        return "extract_error"
+    return "unknown"
+
+
+def portable_review_eval_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a local evaluation result to path- and text-free portable JSON."""
+    summary = {
+        key: value
+        for key, value in result.get("summary", {}).items()
+        if key != "archive_root"
+    }
+    portable_splits = []
+    scalar_metric_types = (str, int, float, bool, type(None))
+    for item in result.get("splits", []):
+        family_basis = str(item.get("family_id") or item.get("paper_id") or "family")
+        case_basis = str(item.get("case_id") or item.get("paper_id") or "case")
+        metrics = {
+            key: value
+            for key, value in item.get("metrics", {}).items()
+            if isinstance(value, scalar_metric_types)
+        }
+        portable_splits.append(
+            {
+                "family_id": f"family_{_stable_short_hash(family_basis)}",
+                "case_id": f"case_{_stable_short_hash(case_basis)}",
+                "benchmark_tier": item.get("benchmark_tier", ""),
+                "paper_text_status": _portable_paper_text_status(
+                    item.get("paper_text_status")
+                ),
+                "human_issue_candidate_count": item.get("human_issue_candidate_count", 0),
+                "human_issue_count": item.get("human_issue_count", 0),
+                "human_issue_excluded_count": item.get("human_issue_excluded_count", 0),
+                "human_issue_cluster_count": item.get("human_issue_cluster_count", 0),
+                "major_issue_cluster_count": item.get("major_issue_cluster_count", 0),
+                "generated_issue_count": item.get("generated_issue_count", 0),
+                "estimated_cost_usd": item.get("estimated_cost_usd", 0.0),
+                "actual_usage": item.get("actual_usage", {}),
+                "metrics": metrics,
+                "status": item.get("status", ""),
+            }
+        )
+    return {
+        "status": result.get("status", ""),
+        "schema_version": "portable_review_eval_v1",
+        "summary": summary,
+        "run_metadata": result.get("run_metadata", {}),
+        "splits": portable_splits,
+    }
+
+
+def portable_review_prior_eval_gate_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Project the three-mode gate to aggregate/path-free portable JSON."""
+    modes: Dict[str, Dict[str, Any]] = {}
+    for mode in REVIEW_PRIOR_EVAL_MODES:
+        mode_result = result.get("modes", {}).get(mode, {})
+        projected = portable_review_eval_result(mode_result)
+        modes[mode] = {
+            "summary": projected["summary"],
+            "splits": projected["splits"],
+        }
+    summary = {
+        key: value
+        for key, value in result.get("summary", {}).items()
+        if key != "archive_root"
+    }
+    return {
+        "schema_version": "portable_review_prior_eval_gate_v1",
+        "summary": summary,
+        "modes": modes,
+        "gate": result.get("gate", {}),
+    }
+
+
+def _write_private_json(path: str | Path, payload: Dict[str, Any]) -> Path:
+    out = Path(path).expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    out.parent.chmod(0o700)
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{out.name}.",
+        suffix=".tmp",
+        dir=out.parent,
+        text=True,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = -1
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, out)
+        directory_descriptor = os.open(out.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return out
+
+
 async def run_historical_review_eval(
     archive_root: str | Path = DEFAULT_REVIEW_ARCHIVE_PATH,
     output_path: str | Path | None = None,
@@ -3234,36 +3967,121 @@ async def run_historical_review_eval(
     gen_model: str = GENERATION_MODEL,
     top_k: int = 5,
     routing: ModelRoutingConfig | None = None,
+    memory_mode: str = "none",
+    max_cost_usd: float | None = None,
+    adjudication_path: str | Path | None = None,
 ) -> Dict[str, Any]:
     """Plan or run whole-paper historical-review evaluation.
 
-    Dry-run mode extracts matched papers and estimates costs only. API mode runs
-    the full feedback pipeline with the held-out paper removed from review memory.
+    Dry-run mode extracts matched papers and estimates costs only. ``none`` is a
+    true cold baseline: review feedback is retained locally for scoring but is
+    never passed to cost estimation or the feedback pipeline.
     """
+    if memory_mode not in {"none", "local_raw"}:
+        raise ValueError("memory_mode must be one of: none, local_raw")
+    if max_cost_usd is not None:
+        max_cost_usd = _require_positive_finite_cost_ceiling(
+            max_cost_usd,
+            label="Review evaluation cost ceiling",
+        )
+    if run_api:
+        max_cost_usd = _require_positive_finite_cost_ceiling(
+            max_cost_usd,
+            label="Paid review evaluation",
+        )
+        preflight = await run_historical_review_eval(
+            archive_root=archive_root,
+            max_splits=max_splits,
+            paper_ids=paper_ids,
+            run_api=False,
+            include_low_confidence=include_low_confidence,
+            require_existing_pdf=require_existing_pdf,
+            num_agents=num_agents,
+            gen_model=gen_model,
+            top_k=top_k,
+            routing=routing,
+            memory_mode=memory_mode,
+            adjudication_path=adjudication_path,
+        )
+        preflight_cost = float(
+            preflight.get("summary", {}).get("total_estimated_cost_usd", 0.0)
+        )
+        if preflight_cost > max_cost_usd:
+            raise ValueError(
+                "Estimated evaluation cost "
+                f"${preflight_cost:.4f} exceeds max_cost_usd=${max_cost_usd:.4f}"
+            )
+
     routing = routing or build_model_routing(gen_model=gen_model)
     corpus = load_review_corpus(archive_root, include_low_confidence=include_low_confidence)
+    if corpus.get("manifest_version") and top_k != REVIEW_BASELINE_TOP_K:
+        raise ValueError("Manifest baseline evaluation requires top_k=5")
+    if run_api and corpus.get("manifest_version"):
+        git_state = _git_run_state()
+        if git_state.get("commit") == "unknown" or git_state.get("dirty") is not False:
+            raise ValueError(
+                "Paid manifest evaluation requires a clean, committed feedback_llm worktree"
+            )
+    gold_validation: Dict[str, Any] | None = None
+    if corpus.get("manifest_version") and adjudication_path:
+        gold_validation = _load_current_gold_adjudication(corpus, adjudication_path)
+    if run_api and corpus.get("manifest_version"):
+        if not adjudication_path:
+            raise ValueError(
+                "Paid manifest evaluation requires --eval-adjudication with completed gold labels"
+            )
+        if not gold_validation or gold_validation.get("status") != "ready":
+            status = (gold_validation or {}).get("status", "missing")
+            pending = len((gold_validation or {}).get("pending_fields", []))
+            raise ValueError(
+                "Gold adjudication is not ready for paid evaluation "
+                f"(status={status}, pending_fields={pending})"
+            )
     splits = build_review_holdout_splits(
         corpus,
         require_existing_pdf=require_existing_pdf,
         max_splits=max_splits,
         paper_ids=paper_ids,
     )
+    if run_api and corpus.get("manifest_version"):
+        pilot_errors = _manifest_pilot_structure_errors(corpus, splits)
+        if pilot_errors:
+            raise ValueError(
+                "Paid manifest baseline is not the complete fixed pilot: "
+                + "; ".join(pilot_errors)
+            )
     issues_by_paper: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for issue in corpus.get("issues", []):
-        issues_by_paper[issue.get("paper_id", "")].append(issue)
+        issue_key = issue.get("case_id") or issue.get("paper_id", "")
+        issues_by_paper[issue_key].append(issue)
+        if issue.get("paper_id") and issue.get("paper_id") != issue_key:
+            issues_by_paper[issue.get("paper_id", "")].append(issue)
 
     split_results = []
     total_estimated_cost = 0.0
+    actual_spend_usd = 0.0
+    generated_for_adjudication: List[Dict[str, Any]] = []
     for split in splits:
         paper_id = split["paper_id"]
-        train_corpus = filter_review_corpus_for_holdout(corpus, paper_id)
-        paper_text, paper_text_status, paper_file = _extract_first_holdout_paper_text(split)
+        family_id = split.get("family_id") or paper_id
+        case_id = split.get("case_id") or paper_id
+        train_corpus = filter_review_corpus_for_holdout(
+            corpus,
+            paper_id,
+            heldout_family_id=family_id,
+        )
+        pipeline_review_corpus = train_corpus if memory_mode == "local_raw" else None
+        paper_text, paper_text_status, paper_files = _extract_holdout_manuscript_bundle(split)
         item = {
             "paper_id": paper_id,
+            "family_id": family_id,
+            "case_id": case_id,
+            "benchmark_tier": split.get("benchmark_tier", ""),
+            "source_types": split.get("source_types", []),
             "review_files": split.get("review_files", []),
             "journals": split.get("journals", []),
             "decisions": split.get("decisions", []),
-            "matched_paper_file": paper_file,
+            "matched_paper_files": paper_files,
             "paper_text_status": paper_text_status,
             "human_issue_candidate_count": split.get("human_issue_candidate_count", 0),
             "human_issue_count": split.get("human_issue_count", 0),
@@ -3275,6 +4093,13 @@ async def run_historical_review_eval(
             "issue_types": split.get("issue_types", []),
             "train_record_count": train_corpus["stats"]["records"],
             "train_issue_count": train_corpus["stats"]["issues"],
+            "memory_record_count": (
+                train_corpus["stats"]["records"] if pipeline_review_corpus else 0
+            ),
+            "memory_issue_count": (
+                train_corpus["stats"]["issues"] if pipeline_review_corpus else 0
+            ),
+            "memory_mode": memory_mode,
             "status": "planned",
         }
         if paper_text.strip():
@@ -3292,17 +4117,26 @@ async def run_historical_review_eval(
                 gen_model=gen_model,
                 top_k=top_k,
                 routing=routing,
-                review_corpus=train_corpus,
+                review_corpus=pipeline_review_corpus,
+                review_prior=None,
             )
-            item["estimated_cost_usd"] = round(cost["estimated_total_cost_usd"], 6)
+            estimated_case_cost = float(cost["estimated_total_cost_usd"])
+            if not math.isfinite(estimated_case_cost) or estimated_case_cost < 0:
+                raise ValueError("Evaluation produced an invalid cost estimate")
+            item["estimated_cost_usd"] = round(estimated_case_cost, 6)
             item["estimated_prompt_tokens"] = sum(
                 stage.get("prompt_tokens", 0) for stage in cost.get("stages", {}).values()
             )
-            total_estimated_cost += cost["estimated_total_cost_usd"]
+            total_estimated_cost += estimated_case_cost
         else:
             item["status"] = "skipped_no_extractable_paper_text"
 
         if run_api and paper_text.strip():
+            estimated_case_cost = float(item.get("estimated_cost_usd", 0.0))
+            if actual_spend_usd + estimated_case_cost > float(max_cost_usd):
+                item["status"] = "skipped_cost_ceiling"
+                split_results.append(item)
+                continue
             api_redaction = redact_identifying_info_for_api(paper_text)
             api_paper_text = api_redaction["safe_text"]
             pipeline_result = await full_feedback_pipeline(
@@ -3311,10 +4145,21 @@ async def run_historical_review_eval(
                 gen_model=gen_model,
                 top_k=top_k,
                 routing=routing,
-                review_corpus=train_corpus,
+                review_corpus=pipeline_review_corpus,
+                review_prior=None,
             )
-            generated = _generated_issues_for_eval(pipeline_result)
-            human_issues = issues_by_paper.get(paper_id, [])
+            generated = _generated_issues_for_eval(pipeline_result, top_k=top_k)
+            human_issues = issues_by_paper.get(case_id, issues_by_paper.get(paper_id, []))
+            for rank, issue in enumerate(generated, start=1):
+                adjudication_issue = dict(issue)
+                adjudication_issue.update(
+                    {
+                        "family_id": family_id,
+                        "case_id": case_id,
+                        "rank": rank,
+                    }
+                )
+                generated_for_adjudication.append(adjudication_issue)
             item["generated_issue_count"] = len(generated)
             item["generated_issue_summaries"] = [
                 {
@@ -3333,7 +4178,18 @@ async def run_historical_review_eval(
                 top_k=top_k,
             )
             item["actual_usage"] = pipeline_result.get("actual_usage", {})
-            item["status"] = "api_evaluated"
+            actual_case_cost = float(
+                item["actual_usage"].get("total_cost_usd", estimated_case_cost)
+                or 0.0
+            )
+            if not math.isfinite(actual_case_cost) or actual_case_cost < 0:
+                actual_case_cost = estimated_case_cost
+            actual_spend_usd += actual_case_cost
+            item["status"] = (
+                "pending_human_adjudication"
+                if corpus.get("manifest_version")
+                else "api_evaluated"
+            )
         elif run_api:
             item["status"] = "skipped_no_extractable_paper_text"
         elif paper_text.strip():
@@ -3342,16 +4198,27 @@ async def run_historical_review_eval(
         split_results.append(item)
 
     evaluated = [item for item in split_results if item.get("metrics")]
-    corpus_target_issues, corpus_excluded_targets = filter_human_review_target_issues(
-        corpus.get("issues", [])
-    )
+    if corpus.get("manifest_version"):
+        corpus_target_issues = _manifest_evaluation_issues(corpus)
+        corpus_excluded_targets = [
+            issue
+            for issue in corpus.get("issues", [])
+            if issue.get("disposition", "evaluation") != "evaluation"
+        ]
+    else:
+        corpus_target_issues, corpus_excluded_targets = filter_human_review_target_issues(
+            corpus.get("issues", [])
+        )
     summary = {
         "archive_root": str(archive_root),
         "mode": "api" if run_api else "dry_run",
+        "memory_mode": memory_mode,
+        "max_cost_usd": max_cost_usd,
         "splits": len(split_results),
         "api_evaluated_splits": len(evaluated),
         "extractable_splits": sum(1 for item in split_results if item.get("paper_text_status") == "ok"),
         "total_estimated_cost_usd": round(total_estimated_cost, 6),
+        "total_actual_cost_usd": round(actual_spend_usd, 6),
         "corpus_records": corpus["stats"]["records"],
         "corpus_issue_candidates": corpus["stats"]["issues"],
         "corpus_issue_targets": len(corpus_target_issues),
@@ -3393,14 +4260,69 @@ async def run_historical_review_eval(
         )
 
     result = {
+        "status": (
+            "pending_human_adjudication"
+            if run_api and corpus.get("manifest_version")
+            else ("api_evaluated" if run_api else "dry_run")
+        ),
         "summary": summary,
         "splits": split_results,
+        "run_metadata": _review_eval_run_metadata(
+            corpus,
+            routing=routing,
+            num_agents=num_agents,
+            top_k=top_k,
+            memory_mode=memory_mode,
+            splits=splits,
+        ),
     }
+    if gold_validation is not None:
+        result["gold_adjudication"] = {
+            "status": gold_validation.get("status"),
+            "binding_hash": gold_validation.get("binding_hash", ""),
+            "pending_fields": len(gold_validation.get("pending_fields", [])),
+        }
+    if run_api and corpus.get("manifest_version"):
+        from review_adjudication import write_generated_adjudication_packet
+
+        adjudication_dir = Path(str(adjudication_path)).expanduser().resolve().parent
+        audit_errors = _manifest_baseline_audit_errors(corpus, result)
+        if audit_errors:
+            result["status"] = "incomplete_run"
+            result["generated_adjudication"] = {
+                "status": "not_created_incomplete_run",
+                "errors": audit_errors,
+            }
+        else:
+            generated_packet = write_generated_adjudication_packet(
+                generated_for_adjudication,
+                gold_validation or {},
+                adjudication_dir,
+                run_binding_context={
+                    "corpus_binding_hash": _corpus_binding_hash(corpus),
+                    "git_commit": result["run_metadata"]["git"]["commit"],
+                    "routing": result["run_metadata"]["routing"],
+                    "top_k": REVIEW_BASELINE_TOP_K,
+                    "memory_mode": memory_mode,
+                    "benchmark_binding": result["run_metadata"].get(
+                        "benchmark_binding", {}
+                    ),
+                },
+                top_k=REVIEW_BASELINE_TOP_K,
+            )
+            result["generated_adjudication"] = {
+                "status": generated_packet.get("status"),
+                "binding_hash": generated_packet.get("binding_hash"),
+                "csv_path": generated_packet.get("csv_path"),
+                "markdown_path": generated_packet.get("markdown_path"),
+            }
+        local_audit_path = adjudication_dir / "baseline_run.local_audit.json"
+        _write_private_json(local_audit_path, result)
+        result["local_audit_path"] = str(local_audit_path)
     if output_path:
-        out = Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        out = _write_private_json(output_path, portable_review_eval_result(result))
         result["output_path"] = str(out)
+        result["output_schema"] = "portable_review_eval_v1"
     return result
 
 
@@ -3420,6 +4342,7 @@ async def run_review_prior_eval_gate(
     review_prior_min_comments: int = 3,
     review_prior_top_k: int = 5,
     batch_api: bool = False,
+    max_cost_usd: float | None = None,
 ) -> Dict[str, Any]:
     """Evaluate baseline, safe-prior, and raw-memory modes on held-out reviews.
 
@@ -3428,8 +4351,45 @@ async def run_review_prior_eval_gate(
     prior artifact.
     """
     routing = routing or build_model_routing(gen_model=gen_model)
+    paid_ceiling: float | None = None
+    if max_cost_usd is not None:
+        max_cost_usd = _require_positive_finite_cost_ceiling(
+            max_cost_usd,
+            label="Review-prior evaluation cost ceiling",
+        )
+    if run_api:
+        paid_ceiling = _require_positive_finite_cost_ceiling(
+            max_cost_usd,
+            label="Paid review-prior evaluation",
+        )
     if run_api and batch_api and _ACTIVE_BATCH_CHAT_CLIENT is None:
         raise ValueError("batch_api=True requires openai_batch_chat_context")
+    if run_api:
+        preflight = await run_review_prior_eval_gate(
+            archive_root=archive_root,
+            max_splits=max_splits,
+            paper_ids=paper_ids,
+            run_api=False,
+            include_low_confidence=include_low_confidence,
+            require_existing_pdf=require_existing_pdf,
+            num_agents=num_agents,
+            gen_model=gen_model,
+            top_k=top_k,
+            routing=routing,
+            review_prior_min_papers=review_prior_min_papers,
+            review_prior_min_comments=review_prior_min_comments,
+            review_prior_top_k=review_prior_top_k,
+            batch_api=batch_api,
+        )
+        preflight_cost = sum(
+            float(mode.get("summary", {}).get("total_estimated_cost_usd", 0.0))
+            for mode in preflight.get("modes", {}).values()
+        )
+        if preflight_cost > float(paid_ceiling):
+            raise ValueError(
+                "Estimated review-prior gate cost "
+                f"${preflight_cost:.4f} exceeds max_cost_usd=${paid_ceiling:.4f}"
+            )
     corpus = load_review_corpus(archive_root, include_low_confidence=include_low_confidence)
     splits = build_review_holdout_splits(
         corpus,
@@ -3439,20 +4399,25 @@ async def run_review_prior_eval_gate(
     )
     issues_by_paper: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for issue in corpus.get("issues", []):
-        issues_by_paper[issue.get("paper_id", "")].append(issue)
+        issue_key = issue.get("case_id") or issue.get("paper_id", "")
+        issues_by_paper[issue_key].append(issue)
+        if issue.get("paper_id") and issue.get("paper_id") != issue_key:
+            issues_by_paper[issue.get("paper_id", "")].append(issue)
 
     mode_results: Dict[str, Dict[str, Any]] = {
         mode: {"summary": {"mode": mode}, "splits": []}
         for mode in REVIEW_PRIOR_EVAL_MODES
     }
     api_jobs: List[Any] = []
+    actual_spend_usd = 0.0
+    reserved_batch_spend_usd = 0.0
 
     async def evaluate_item(
         item: Dict[str, Any],
         paper_id: str,
         api_paper_text: str,
         pipeline_kwargs: Dict[str, Any],
-    ) -> None:
+    ) -> float:
         pipeline_result = await full_feedback_pipeline(
             api_paper_text,
             num_agents=num_agents,
@@ -3461,8 +4426,11 @@ async def run_review_prior_eval_gate(
             routing=routing,
             **pipeline_kwargs,
         )
-        generated = _generated_issues_for_eval(pipeline_result)
-        human_issues = issues_by_paper.get(paper_id, [])
+        generated = _generated_issues_for_eval(pipeline_result, top_k=top_k)
+        human_issues = issues_by_paper.get(
+            item.get("case_id") or paper_id,
+            issues_by_paper.get(paper_id, []),
+        )
         item["generated_issue_count"] = len(generated)
         item["generated_issue_summaries"] = [
             {
@@ -3485,11 +4453,25 @@ async def run_review_prior_eval_gate(
         item["generated_issue_quality"] = _generated_issue_quality_summary(generated)
         item["actual_usage"] = pipeline_result.get("actual_usage", {})
         item["status"] = "api_evaluated"
+        actual_cost = float(
+            item["actual_usage"].get(
+                "total_cost_usd",
+                item.get("estimated_cost_usd", 0.0),
+            )
+            or 0.0
+        )
+        if not math.isfinite(actual_cost) or actual_cost < 0:
+            actual_cost = float(item.get("estimated_cost_usd", 0.0) or 0.0)
+        return actual_cost
 
     for split in splits:
         paper_id = split["paper_id"]
-        train_corpus = filter_review_corpus_for_holdout(corpus, paper_id)
-        paper_text, paper_text_status, paper_file = _extract_first_holdout_paper_text(split)
+        train_corpus = filter_review_corpus_for_holdout(
+            corpus,
+            paper_id,
+            heldout_family_id=split.get("family_id"),
+        )
+        paper_text, paper_text_status, paper_files = _extract_holdout_manuscript_bundle(split)
         api_redaction: Dict[str, Any] | None = None
         api_paper_text = ""
         if paper_text.strip():
@@ -3510,9 +4492,11 @@ async def run_review_prior_eval_gate(
         for mode in REVIEW_PRIOR_EVAL_MODES:
             item = {
                 "paper_id": paper_id,
+                "family_id": split.get("family_id") or paper_id,
+                "case_id": split.get("case_id") or paper_id,
                 "eval_mode": mode,
                 "review_files": split.get("review_files", []),
-                "matched_paper_file": paper_file,
+                "matched_paper_files": paper_files,
                 "paper_text_status": paper_text_status,
                 "human_issue_candidate_count": split.get("human_issue_candidate_count", 0),
                 "human_issue_count": split.get("human_issue_count", 0),
@@ -3569,29 +4553,49 @@ async def run_review_prior_eval_gate(
                 **cost_kwargs,
             )
             estimated_cost = float(cost["estimated_total_cost_usd"])
+            if not math.isfinite(estimated_cost) or estimated_cost < 0:
+                raise ValueError("Review-prior evaluation produced an invalid cost estimate")
             if batch_api:
                 item["estimated_cost_usd_without_batch_discount"] = round(estimated_cost, 6)
                 item["batch_api_chat_price_multiplier"] = 0.5
                 estimated_cost = _batch_discounted_cost_estimate(cost)
+                if not math.isfinite(estimated_cost) or estimated_cost < 0:
+                    raise ValueError(
+                        "Review-prior evaluation produced an invalid batch cost estimate"
+                    )
             item["estimated_cost_usd"] = round(estimated_cost, 6)
             item["estimated_prompt_tokens"] = sum(
                 stage.get("prompt_tokens", 0) for stage in cost.get("stages", {}).values()
             )
 
             if run_api:
+                budget_used = (
+                    reserved_batch_spend_usd if batch_api else actual_spend_usd
+                )
+                if budget_used + estimated_cost > float(paid_ceiling):
+                    item["status"] = "skipped_cost_ceiling"
+                    mode_results[mode]["splits"].append(item)
+                    continue
                 if batch_api:
+                    reserved_batch_spend_usd += estimated_cost
                     item["status"] = "queued_for_batch_api"
                     mode_results[mode]["splits"].append(item)
                     api_jobs.append(evaluate_item(item, paper_id, api_paper_text, dict(pipeline_kwargs)))
                     continue
-                await evaluate_item(item, paper_id, api_paper_text, pipeline_kwargs)
+                actual_spend_usd += await evaluate_item(
+                    item,
+                    paper_id,
+                    api_paper_text,
+                    pipeline_kwargs,
+                )
             else:
                 item["status"] = "dry_run_estimated"
 
             mode_results[mode]["splits"].append(item)
 
     if api_jobs:
-        await asyncio.gather(*api_jobs)
+        batch_actual_costs = await asyncio.gather(*api_jobs)
+        actual_spend_usd = sum(batch_actual_costs)
 
     for mode, mode_result in mode_results.items():
         summary = _review_eval_metric_summary(mode_result["splits"])
@@ -3614,15 +4618,19 @@ async def run_review_prior_eval_gate(
             "review_prior_min_papers": review_prior_min_papers,
             "review_prior_min_comments": review_prior_min_comments,
             "batch_api": batch_api,
+            "max_cost_usd": max_cost_usd,
+            "total_actual_cost_usd": round(actual_spend_usd, 6),
         },
         "modes": mode_results,
         "gate": _review_prior_eval_gate(mode_results),
     }
     if output_path:
-        out = Path(output_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        out = _write_private_json(
+            output_path,
+            portable_review_prior_eval_gate_result(result),
+        )
         result["output_path"] = str(out)
+        result["output_schema"] = "portable_review_prior_eval_gate_v1"
     return result
 
 
@@ -3674,6 +4682,7 @@ def render_historical_review_eval_summary(result: Dict[str, Any]) -> str:
         "# Historical Review Evaluation",
         "",
         f"- Mode: {summary.get('mode', 'dry_run')}",
+        f"- Review-memory mode: {summary.get('memory_mode', 'local_raw')}",
         f"- Corpus records: {summary.get('corpus_records', 0)}",
         f"- Corpus issue candidates: {summary.get('corpus_issue_candidates', 0)}",
         f"- Corpus scored issue targets: {summary.get('corpus_issue_targets', 0)}",
@@ -3684,6 +4693,10 @@ def render_historical_review_eval_summary(result: Dict[str, Any]) -> str:
         f"- API-evaluated splits: {summary.get('api_evaluated_splits', 0)}",
         f"- Estimated total API cost: ${summary.get('total_estimated_cost_usd', 0.0):.4f}",
     ]
+    if summary.get("mode") == "api":
+        lines.append(
+            f"- Actual API cost recorded: ${summary.get('total_actual_cost_usd', 0.0):.4f}"
+        )
     if summary.get("api_evaluated_splits"):
         lines.extend(
             [
@@ -3753,15 +4766,24 @@ def render_review_corpus_summary(corpus: Dict[str, Any]) -> str:
         by_journal[record.get("journal", "Unknown")] += 1
     for issue in corpus.get("issues", []):
         by_issue_type[issue.get("issue_type", "other")] += 1
+    is_manifest = bool(corpus.get("manifest_version"))
     lines = [
         "# Review Corpus Summary",
         "",
-        f"- Archive root: `{corpus.get('archive_root', '')}`",
+        (
+            f"- Corpus ID: `{corpus.get('corpus_id', '')}`"
+            if is_manifest
+            else f"- Archive root: `{corpus.get('archive_root', '')}`"
+        ),
         f"- Review records: {stats.get('records', 0)}",
         f"- Issue candidates: {stats.get('issues', 0)}",
         f"- Source kind: {stats.get('source_kind', REVIEW_MEMORY_SOURCE_KIND)}",
         f"- Raw Gmail review records: {stats.get('raw_review_records', 0)}",
-        "- Source note: raw Gmail sidecars are used when available; remaining records use extracted review digests.",
+        (
+            "- Source note: manifest files are hash-bound and imported locally; raw paths and text are omitted here."
+            if is_manifest
+            else "- Source note: raw Gmail sidecars are used when available; remaining records use extracted review digests."
+        ),
         f"- Low-confidence records excluded: {stats.get('excluded_low_confidence_records', 0)}",
         f"- Records with matched papers: {stats.get('records_with_papers', 0)}",
         f"- Unique matched PDF files: {stats.get('matched_pdf_files', 0)}",
@@ -8306,6 +9328,10 @@ __all__ = [
     "filter_review_corpus_for_holdout",
     "build_review_holdout_splits",
     "extract_text_from_paper_file",
+    "prepare_review_adjudication",
+    "finalize_review_evaluation",
+    "portable_review_eval_result",
+    "portable_review_prior_eval_gate_result",
     "run_historical_review_eval",
     "render_historical_review_eval_summary",
     "run_review_prior_eval_gate",
@@ -8487,6 +9513,11 @@ def main(argv: List[str] | None = None) -> int:
       python -m feedback_pipeline --file paper.txt
       cat paper.txt | python -m feedback_pipeline
     """
+    cli_tokens = list(argv) if argv is not None else sys.argv[1:]
+
+    def option_was_used(option: str) -> bool:
+        return any(token == option or token.startswith(option + "=") for token in cli_tokens)
+
     parser = ArgumentParser(description="Run the feedback pipeline on a paper.")
     parser.add_argument(
         "--file",
@@ -8546,7 +9577,7 @@ def main(argv: List[str] | None = None) -> int:
         "--review-corpus",
         type=str,
         default=None,
-        help="Optional path to a historical review archive for reviewer-memory calibration.",
+        help="Optional legacy review archive, private manifest, or normalized corpus path.",
     )
     parser.add_argument(
         "--review-prior",
@@ -8564,6 +9595,19 @@ def main(argv: List[str] | None = None) -> int:
         "--inspect-review-corpus",
         action="store_true",
         help="Load the review corpus, print a local summary, and exit without calling the API.",
+    )
+    parser.add_argument(
+        "--prepare-review-adjudication",
+        type=str,
+        default=None,
+        metavar="OUTPUT_DIR",
+        help="Create private CSV/Markdown gold-adjudication files locally and exit.",
+    )
+    parser.add_argument(
+        "--review-corpus-output",
+        type=str,
+        default=None,
+        help="Optional private normalized-corpus JSON output used with corpus inspection.",
     )
     parser.add_argument(
         "--distill-review-prior",
@@ -8604,7 +9648,7 @@ def main(argv: List[str] | None = None) -> int:
         "--eval-review-corpus",
         type=str,
         default=None,
-        help="Build a whole-paper held-out review-eval plan for a review archive.",
+        help="Build a whole-paper held-out review-eval plan for an archive or manifest.",
     )
     parser.add_argument(
         "--eval-review-prior-gate",
@@ -8636,6 +9680,37 @@ def main(argv: List[str] | None = None) -> int:
         help="Actually run paid API evaluation for held-out splits. Omit for dry-run planning only.",
     )
     parser.add_argument(
+        "--eval-memory-mode",
+        choices=("none", "local_raw"),
+        default="none",
+        help="Historical-review memory available to the evaluated pipeline (default: none).",
+    )
+    parser.add_argument(
+        "--eval-max-cost-usd",
+        type=float,
+        default=None,
+        help="Required hard preflight ceiling for paid review evaluation.",
+    )
+    parser.add_argument(
+        "--eval-adjudication",
+        type=str,
+        default=None,
+        help="Completed, hash-bound gold-adjudication CSV for paid manifest evaluation.",
+    )
+    parser.add_argument(
+        "--eval-generated-adjudication",
+        type=str,
+        default=None,
+        help="Completed generated top-five adjudication CSV used to finalize metrics.",
+    )
+    parser.add_argument(
+        "--finalize-review-eval",
+        type=str,
+        default=None,
+        metavar="LOCAL_AUDIT_JSON",
+        help="Validate completed packets and write final privacy-safe metrics without API calls.",
+    )
+    parser.add_argument(
         "--eval-batch-api",
         action="store_true",
         help="Use OpenAI Batch API for --eval-review-prior-gate chat completions.",
@@ -8663,7 +9738,130 @@ def main(argv: List[str] | None = None) -> int:
         action="store_true",
         help="Include held-out splits even if no matched paper PDF currently exists.",
     )
-    args = parser.parse_args(argv)
+    args = parser.parse_args(cli_tokens)
+
+    operation_modes = {
+        "--finalize-review-eval": bool(args.finalize_review_eval),
+        "--distill-review-prior": bool(args.distill_review_prior),
+        "--prepare-review-adjudication": bool(args.prepare_review_adjudication),
+        "--inspect-review-corpus": bool(args.inspect_review_corpus),
+        "--eval-review-prior-gate": bool(args.eval_review_prior_gate),
+        "--eval-review-corpus": bool(args.eval_review_corpus),
+    }
+    active_modes = [name for name, active in operation_modes.items() if active]
+    if len(active_modes) > 1:
+        parser.error(
+            "Operation modes are mutually exclusive: " + ", ".join(active_modes)
+        )
+    if active_modes and any((args.file, args.paste, args.clipboard, args.pdf)):
+        parser.error("Paper input flags cannot be combined with a corpus/evaluation operation mode")
+
+    eval_mode = bool(
+        args.eval_review_corpus
+        or args.eval_review_prior_gate
+        or args.finalize_review_eval
+    )
+    paid_eval_mode = bool(args.eval_review_corpus or args.eval_review_prior_gate)
+    if args.eval_run_api and not paid_eval_mode:
+        parser.error("--eval-run-api requires --eval-review-corpus or --eval-review-prior-gate")
+    if args.eval_run_api and args.eval_max_cost_usd is None:
+        parser.error("--eval-run-api requires --eval-max-cost-usd")
+    if args.eval_max_cost_usd is not None:
+        try:
+            _require_positive_finite_cost_ceiling(
+                args.eval_max_cost_usd,
+                label="Review evaluation cost ceiling",
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+    if args.eval_max_cost_usd is not None and not paid_eval_mode:
+        parser.error("--eval-max-cost-usd requires an evaluation run mode")
+    if args.eval_output and not eval_mode:
+        parser.error("--eval-output requires an evaluation or finalization mode")
+    if (args.eval_limit is not None or args.eval_paper_id or args.eval_allow_missing_pdf) and not (
+        args.eval_review_corpus or args.eval_review_prior_gate
+    ):
+        parser.error(
+            "--eval-limit, --eval-paper-id, and --eval-allow-missing-pdf "
+            "require an evaluation run mode"
+        )
+    if option_was_used("--eval-memory-mode") and not args.eval_review_corpus:
+        parser.error("--eval-memory-mode is only valid with --eval-review-corpus")
+    if args.eval_adjudication and not (
+        args.eval_review_corpus or args.finalize_review_eval
+    ):
+        parser.error(
+            "--eval-adjudication requires --eval-review-corpus or --finalize-review-eval"
+        )
+    if args.eval_generated_adjudication and not args.finalize_review_eval:
+        parser.error(
+            "--eval-generated-adjudication requires --finalize-review-eval"
+        )
+    batch_option_used = any(
+        option_was_used(option)
+        for option in (
+            "--eval-batch-api",
+            "--batch-output-dir",
+            "--batch-poll-interval",
+            "--batch-wait-timeout",
+        )
+    )
+    if batch_option_used and not args.eval_review_prior_gate:
+        parser.error("Batch options are only valid with --eval-review-prior-gate")
+    if args.review_corpus_output and not args.inspect_review_corpus:
+        parser.error("--review-corpus-output requires --inspect-review-corpus")
+    if (args.review_prior_output or args.review_prior_audit_output) and not args.distill_review_prior:
+        parser.error(
+            "--review-prior-output and --review-prior-audit-output require "
+            "--distill-review-prior"
+        )
+    if args.review_prior and active_modes:
+        parser.error("--review-prior is only valid for a normal paper feedback run")
+    if args.review_corpus and (args.eval_review_corpus or args.eval_review_prior_gate or args.distill_review_prior):
+        parser.error(
+            "--review-corpus is not used by this mode; pass the corpus path to the selected operation flag"
+        )
+    review_prior_threshold_used = any(
+        option_was_used(option)
+        for option in ("--review-prior-min-papers", "--review-prior-min-comments")
+    )
+    if review_prior_threshold_used and not (
+        args.distill_review_prior or args.eval_review_prior_gate
+    ):
+        parser.error(
+            "Reviewer-prior threshold flags require --distill-review-prior "
+            "or --eval-review-prior-gate"
+        )
+
+    if args.finalize_review_eval:
+        missing = []
+        if not args.review_corpus:
+            missing.append("--review-corpus")
+        if not args.eval_adjudication:
+            missing.append("--eval-adjudication")
+        if not args.eval_generated_adjudication:
+            missing.append("--eval-generated-adjudication")
+        if missing:
+            parser.error(
+                "--finalize-review-eval requires " + ", ".join(missing)
+            )
+        try:
+            result = finalize_review_evaluation(
+                args.review_corpus,
+                args.eval_adjudication,
+                args.eval_generated_adjudication,
+                args.finalize_review_eval,
+                output_path=args.eval_output,
+            )
+        except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as e:
+            print(f"Review eval finalization error: {e}", file=sys.stderr)
+            return 1
+        print("# Final Review Evaluation Metrics")
+        print("")
+        print(json.dumps(result.get("metrics", {}), ensure_ascii=False, indent=2))
+        if result.get("output_path"):
+            print(f"\n- Saved JSON: `{result['output_path']}`")
+        return 0
 
     if args.distill_review_prior:
         try:
@@ -8694,6 +9892,27 @@ def main(argv: List[str] | None = None) -> int:
                 print(f"- {label}: {path}")
         return 0
 
+    if args.prepare_review_adjudication:
+        if not args.review_corpus:
+            parser.error("--prepare-review-adjudication requires --review-corpus")
+        try:
+            packet = prepare_review_adjudication(
+                args.review_corpus,
+                args.prepare_review_adjudication,
+            )
+        except (FileNotFoundError, OSError, ValueError) as e:
+            print(f"Review adjudication error: {e}", file=sys.stderr)
+            return 1
+        print("# Gold Review Adjudication Packet")
+        print("")
+        print(f"- Status: {packet.get('status')}")
+        print(f"- Imported issues: {packet.get('issue_count', 0)}")
+        print(f"- Clusters: {packet.get('cluster_count', 0)}")
+        print(f"- Full adjudication rows: {packet.get('full_adjudication_count', 0)}")
+        print(f"- CSV: `{packet.get('csv_path', '')}`")
+        print(f"- Reading packet: `{packet.get('markdown_path', '')}`")
+        return 0
+
     if args.inspect_review_corpus:
         corpus_path = args.review_corpus or DEFAULT_REVIEW_ARCHIVE_PATH
         try:
@@ -8701,10 +9920,24 @@ def main(argv: List[str] | None = None) -> int:
                 corpus_path,
                 include_low_confidence=args.include_low_confidence_reviews,
             )
-        except (FileNotFoundError, OSError) as e:
+        except (FileNotFoundError, OSError, ValueError) as e:
             print(f"Review corpus error: {e}", file=sys.stderr)
             return 1
+        if args.review_corpus_output:
+            try:
+                from review_corpus_manifest import write_private_corpus
+
+                normalized_path = write_private_corpus(
+                    corpus,
+                    args.review_corpus_output,
+                )
+            except (OSError, ValueError) as e:
+                print(f"Review corpus output error: {e}", file=sys.stderr)
+                return 1
+            corpus["normalized_output_path"] = str(normalized_path)
         print(render_review_corpus_summary(corpus))
+        if corpus.get("normalized_output_path"):
+            print(f"\n- Private normalized corpus: `{corpus['normalized_output_path']}`")
         return 0
 
     if args.eval_review_prior_gate:
@@ -8733,6 +9966,7 @@ def main(argv: List[str] | None = None) -> int:
                     "review_prior_min_comments": args.review_prior_min_comments,
                     "review_prior_top_k": args.review_prior_top_k,
                     "batch_api": args.eval_batch_api,
+                    "max_cost_usd": args.eval_max_cost_usd,
                 }
                 if args.eval_batch_api and args.eval_run_api:
                     async with openai_batch_chat_context(
@@ -8747,10 +9981,12 @@ def main(argv: List[str] | None = None) -> int:
                         "submissions": manager.submissions,
                     }
                     if args.eval_output:
-                        out = Path(args.eval_output)
-                        out.parent.mkdir(parents=True, exist_ok=True)
-                        out.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                        out = _write_private_json(
+                            args.eval_output,
+                            portable_review_prior_eval_gate_result(result),
+                        )
                         result["output_path"] = str(out)
+                        result["output_schema"] = "portable_review_prior_eval_gate_v1"
                     return result
                 return await run_review_prior_eval_gate(**run_kwargs)
 
@@ -8781,9 +10017,12 @@ def main(argv: List[str] | None = None) -> int:
                     num_agents=args.agents,
                     gen_model=args.model,
                     top_k=args.top_k,
+                    memory_mode=args.eval_memory_mode,
+                    max_cost_usd=args.eval_max_cost_usd,
+                    adjudication_path=args.eval_adjudication,
                 )
             )
-        except (FileNotFoundError, OSError) as e:
+        except (FileNotFoundError, OSError, ValueError) as e:
             print(f"Review eval error: {e}", file=sys.stderr)
             return 1
         print(render_historical_review_eval_summary(result))

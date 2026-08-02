@@ -83,8 +83,12 @@ Paper text
 - `--include-evidence-appendix` appends deterministic evidence excerpts for cited IDs.
 - `--include-audit-appendix` appends the full deterministic substantive checklist and evidence lookup.
 - Actual token usage and cost are printed unless `--no-cost-estimate` is passed.
-- `--inspect-review-corpus --review-corpus PATH` loads an archived review folder,
-  prints record/issue/paper-match counts, and exits without calling the API.
+- `--inspect-review-corpus --review-corpus PATH` loads either a legacy archive,
+  a private manifest, or a normalized private snapshot and exits without an API call.
+- `--review-corpus-output PATH` writes the normalized private snapshot below
+  `~/.feedback_llm/` with mode `0600`.
+- `--prepare-review-adjudication DIR` writes the hash-bound gold-cluster CSV and
+  Markdown reading packet without an API call.
 - `--include-low-confidence-reviews` includes forwarded/low-confidence records in
   local corpus inspection only.
 - `--review-corpus PATH` on a normal run enables private historical-review memory
@@ -97,6 +101,13 @@ Paper text
 - `--eval-review-corpus PATH` builds whole-paper held-out splits from the archive,
   estimates per-split API cost, and optionally saves a JSON plan without calling
   the API.
+- `--eval-memory-mode none` runs the cold baseline. Historical feedback remains
+  local for scoring and neither a review corpus nor a review prior reaches the pipeline.
+- `--eval-adjudication PATH` supplies completed gold labels for a manifest run.
+- `--finalize-review-eval LOCAL_AUDIT` combines the completed gold and generated
+  packets into privacy-safe aggregate metrics without an API call.
+- `--eval-max-cost-usd N` is mandatory with `--eval-run-api`. Evaluation performs
+  a complete zero-call preflight and rejects a total above the ceiling.
 - `--eval-review-prior-gate PATH` compares three held-out modes: no memory
   baseline, API-safe structured reviewer prior, and local raw-memory upper bound.
   Dry-run mode estimates the full three-way cost without calling the API.
@@ -105,16 +116,44 @@ Paper text
   is stage-by-stage: each concurrent wave is submitted, polled to completion, and
   then the next local stage proceeds. Local JSONL inputs and a batch manifest are
   written under the requested batch output directory.
-- `--eval-run-api` actually runs the held-out evaluation. It should be used only
-  after reviewing the dry-run estimate because it calls the paid API.
+- `--eval-run-api` actually runs the held-out evaluation. Manifest evaluation also
+  requires current, complete gold adjudication. The runner checks the remaining
+  cost allowance before each manuscript family.
 
 ### Historical Review Corpus
 
-The optional review-corpus layer turns a private archive of past journal decisions
-and matched papers into local calibration data. The current archive files are
-extracted review digests, not certified raw referee-report exports. The layer does
-not train a model and does not expose old reviews in the final report. The current
-implementation:
+The optional review-corpus layer accepts two inputs. The legacy path reads archived
+review digests. The manifest path binds exact manuscript versions to raw human
+feedback for evaluation. Neither path trains a model. Historical feedback enters a
+normal paper run only when review memory is explicitly enabled.
+
+#### Manifest corpus
+
+The manifest is private JSON governed by `review_manifest.schema.json`. Each case
+contains a family ID, case ID, ordered manuscript files, benchmark tier, version-match
+status, source disposition, extraction rules, and SHA-256 hashes. The family ID is
+the holdout boundary, so renamed manuscripts and later rounds from the same research
+project cannot enter calibration memory for that family.
+
+Supported extractors are PDF annotations, Word comments, review-PDF text, Markdown,
+text, and Word body text. PDF manuscript extraction ignores annotation comments.
+Word comment extraction reads Office XML directly and keeps the selected manuscript
+anchor. Source selectors can restrict pages, headings, markers, numbered items,
+comment IDs, and annotation types. RTF and XLSX are unsupported. Missing, empty,
+stale, or dataless cloud files fail before cost estimation. Evaluation sources
+must declare human provenance and source type; AI-generated, derivative-summary,
+and response material fail closed.
+
+The importer emits normalized records and atomic issues with pseudonymous reviewer
+IDs, source locators, anchor text, source/manuscript hashes, family/case provenance,
+benchmark tier, and disposition. It removes byte-identical sources and declared
+duplicate representations while retaining independent reviewers. Private snapshots
+stay below `~/.feedback_llm/` with directory mode `0700` and file mode `0600`.
+
+#### Legacy archive and shared evaluation behavior
+
+The legacy archive files are extracted review digests unless a raw Gmail sidecar is
+available. The implementation:
 
 - Parses archived Markdown review digests and `papers/PAPER_MATCHES.md`.
 - Links each review record to matched paper PDFs when available.
@@ -140,12 +179,21 @@ implementation:
   review issue, and a rule-based verifier labels matched, partially matched, or
   novel/unmatched issues. It is still local and non-API, not a paid LLM verifier.
 - Provides a whole-paper held-out eval harness through
-  `run_historical_review_eval()`. Each split removes every review round for one
-  pseudonymous paper ID from review memory, runs or plans the pipeline on the
-  matched paper, and compares generated issues against the held-out issue
-  candidates. Dry-run mode estimates costs only and makes no API calls. API-mode
-  JSON keeps compact generated-issue summaries so matching logic can be audited
-  later without rerunning the paid pipeline.
+  `run_historical_review_eval()`. Manifest splits exclude the complete manuscript
+  family; legacy splits retain paper-ID fallback behavior. The cold baseline passes
+  `review_corpus=None` and `review_prior=None` explicitly. It scores the final
+  post-verification `top_proposals[:5]`, not the larger candidate pool.
+- Plans every selected case and totals its estimated cost before any API request.
+  Paid mode requires a positive cost ceiling and checks the remaining allowance
+  before each case. A paid pilot rejects partial selections and requires the fixed
+  four-primary/one-secondary composition, including three primary journal cases,
+  before its first request. A manifest paid run also requires a clean committed
+  `feedback_llm` worktree. The run records the commit, dirty flag, routing, reasoning
+  effort, reviewer-role counts, thresholds, hashes, token usage, and costs.
+- Writes portable evaluation JSON containing pseudonymous IDs, counts, scalar
+  metrics, hashes, and costs only. Paths, reviewer identities, human text,
+  generated issue text, locators, and adjudicator notes remain in local private
+  artifacts.
 - Provides a reviewer-prior deployment gate through
   `run_review_prior_eval_gate()`. Each split distills the safe prior from training
   reviews only, with the held-out paper-review pair excluded, then compares
@@ -167,6 +215,27 @@ valid concern can be absent from the historical corpus.
 The reviewer-prior artifact follows the same rule: priors may raise checks, rank
 salience, or shape final wording, but they may not support factual claims or affect
 verification. Manuscript evidence remains the only source of support for a critique.
+
+#### Baseline adjudication and metrics
+
+Automatic clustering proposes deduplicated human concerns, but it does not create
+the final gold labels. The gold packet lists every cluster for a tier screen. It
+requires full adjudication for all major clusters and a hash-ranked sample of five
+minor clusters per family using seed `20260802`. The packet records inclusion,
+canonical wording, severity, evidentiary support, duplicate corrections, and an
+exclusion reason where relevant. Its binding hash changes when source content,
+manuscript content, extraction rules, or cluster membership changes.
+
+After a paid run, a second packet contains the final five generated issues per case.
+Every row requires correctness, significance, evidence sufficiency, match status,
+duplicate status, and valid-novelty labels. Lexical matching supplies suggestions
+only. An unmatched generated concern is not counted as false until a person labels
+it. A completed paid generation run remains `pending_human_adjudication` until
+all top-five labels are current; incomplete family runs cannot reach that state.
+Final aggregate metrics are produced only when both packets are current and
+complete. They report family-macro major-cluster recall, the journal-only subset,
+sampled-minor recall, supported-significant precision, valid-novelty yield,
+duplicate rate, and cost. Secondary cases remain outside the primary aggregate.
 
 ### Models and Routing
 
@@ -459,3 +528,7 @@ Current test modules cover:
 - domain scoring, escalation, protected deduplication, and presentation clustering
 - editorial triage caps and decision-impact report prompting
 - mocked end-to-end pipeline behavior
+- manifest validation, PDF/Word/text extraction, source deduplication, ordered
+  manuscript bundles, dataless cloud rejection, and legacy-loader compatibility
+- family-level leakage controls, cold-baseline prompt isolation, top-five scoring,
+  cost ceilings, portable output privacy, and deterministic adjudication artifacts

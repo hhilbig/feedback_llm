@@ -1,0 +1,205 @@
+{
+  "manifest_version": "v1",
+  "corpus_id": "private_feedback_pilot_v1",
+  "template_only": true,
+  "cases": [
+    {
+      "family_id": "family_001",
+      "case_id": "case_001_annotated_manuscript",
+      "benchmark_tier": "primary",
+      "classification": "version_matched_informal_feedback",
+      "disposition": "evaluation",
+      "manuscript_files": [
+        {
+          "path": "private_inputs/case_001/annotated_manuscript.pdf",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "main"
+        }
+      ],
+      "sources": [
+        {
+          "source_id": "source_001_annotations",
+          "path": "private_inputs/case_001/annotated_manuscript.pdf",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "extractor": "pdf_annotations",
+          "reviewer_id": "reviewer_001",
+          "provenance": "human_manuscript_annotations",
+          "source_type": "informal_written_feedback",
+          "feedback_date": "2026-01",
+          "version_match": "exact_embedded",
+          "disposition": "evaluation"
+        }
+      ]
+    },
+    {
+      "family_id": "family_002",
+      "case_id": "case_002_journal_round",
+      "benchmark_tier": "primary",
+      "classification": "exact_journal_review",
+      "disposition": "evaluation",
+      "journal": "journal_001",
+      "manuscript_files": [
+        {
+          "path": "private_inputs/case_002/submission.pdf",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "main"
+        }
+      ],
+      "sources": [
+        {
+          "source_id": "source_002_editor",
+          "path": "private_inputs/case_002/editor.txt",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "extractor": "text",
+          "reviewer_id": "editor_001",
+          "provenance": "journal_decision",
+          "source_type": "editor_report",
+          "feedback_date": "2026-01",
+          "version_match": "exact_submission",
+          "disposition": "evaluation"
+        },
+        {
+          "source_id": "source_002_reviewer_001",
+          "path": "private_inputs/case_002/reviewer_001.txt",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "extractor": "text",
+          "reviewer_id": "reviewer_001",
+          "provenance": "journal_review",
+          "source_type": "reviewer_report",
+          "feedback_date": "2026-01",
+          "version_match": "exact_submission",
+          "disposition": "evaluation"
+        },
+        {
+          "source_id": "source_002_reviewer_002",
+          "path": "private_inputs/case_002/reviewer_002.txt",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "extractor": "text",
+          "reviewer_id": "reviewer_002",
+          "provenance": "journal_review",
+          "source_type": "reviewer_report",
+          "feedback_date": "2026-01",
+          "version_match": "exact_submission",
+          "disposition": "evaluation"
+        },
+        {
+          "source_id": "source_002_reviewer_003",
+          "path": "private_inputs/case_002/reviewer_003.txt",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "extractor": "text",
+          "reviewer_id": "reviewer_003",
+          "provenance": "journal_review",
+          "source_type": "reviewer_report",
+          "feedback_date": "2026-01",
+          "version_match": "exact_submission",
+          "disposition": "evaluation"
+        }
+      ]
+    },
+    {
+      "family_id": "family_003",
+      "case_id": "case_003_journal_round",
+      "benchmark_tier": "primary",
+      "classification": "exact_journal_review",
+      "disposition": "evaluation",
+      "journal": "journal_002",
+      "manuscript_files": [
+        {
+          "path": "private_inputs/case_003/manuscript.pdf",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "main"
+        },
+        {
+          "path": "private_inputs/case_003/appendix.pdf",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "appendix"
+        }
+      ],
+      "sources": [
+        {
+          "source_id": "source_003_review_bundle",
+          "path": "private_inputs/case_003/reviews.docx",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "extractor": "docx_body",
+          "reviewer_id": "reviewer_bundle_001",
+          "provenance": "journal_review",
+          "source_type": "reviewer_report_bundle",
+          "feedback_date": "2026-01",
+          "version_match": "exact_submission",
+          "disposition": "evaluation"
+        }
+      ]
+    },
+    {
+      "family_id": "family_004",
+      "case_id": "case_004_journal_round",
+      "benchmark_tier": "primary",
+      "classification": "exact_journal_review",
+      "disposition": "evaluation",
+      "journal": "journal_003",
+      "manuscript_files": [
+        {
+          "path": "private_inputs/case_004/manuscript.pdf",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "main"
+        },
+        {
+          "path": "private_inputs/case_004/supplement.pdf",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "supplement"
+        }
+      ],
+      "sources": [
+        {
+          "source_id": "source_004_review_bundle",
+          "path": "private_inputs/case_004/reviews.pdf",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "extractor": "pdf_text",
+          "reviewer_id": "reviewer_bundle_001",
+          "provenance": "journal_review",
+          "source_type": "reviewer_report_bundle",
+          "feedback_date": "2026-01",
+          "version_match": "exact_submission",
+          "disposition": "evaluation",
+          "selectors": {
+            "page_start": 1,
+            "page_end": 10
+          }
+        }
+      ]
+    },
+    {
+      "family_id": "family_005",
+      "case_id": "case_005_seminar",
+      "benchmark_tier": "secondary",
+      "classification": "near_exact_seminar_feedback",
+      "disposition": "evaluation",
+      "manuscript_files": [
+        {
+          "path": "private_inputs/case_005/manuscript.pdf",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "role": "main"
+        }
+      ],
+      "sources": [
+        {
+          "source_id": "source_005_human_items",
+          "path": "private_inputs/case_005/seminar_feedback.md",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+          "extractor": "markdown",
+          "reviewer_id": "seminar_audience_001",
+          "provenance": "human_seminar_feedback",
+          "source_type": "seminar_feedback",
+          "feedback_date": "2026-01",
+          "version_match": "near_exact",
+          "disposition": "evaluation",
+          "selectors": {
+            "start_heading": "## Human Feedback",
+            "end_heading": "## Generated Feedback",
+            "include_item_numbers": [1, 2, 3, 4, 5, 6, 7]
+          }
+        }
+      ]
+    }
+  ]
+}

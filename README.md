@@ -85,8 +85,19 @@ python -m feedback_pipeline --agents 16 --model gpt-5.6-terra --top-k 10 --file 
 python -m feedback_pipeline --file paper.txt --include-evidence-appendix
 python -m feedback_pipeline --file paper.txt --include-audit-appendix
 
-# Inspect a local archive of historical journal reviews without calling the API.
+# Inspect a legacy review archive or a hash-bound private manifest without calling the API.
 python -m feedback_pipeline --inspect-review-corpus --review-corpus /path/to/journal_reviews_inbox_2026-06-04
+
+# Validate a private manifest and write a normalized snapshot below ~/.feedback_llm.
+python -m feedback_pipeline \
+  --inspect-review-corpus \
+  --review-corpus ~/.feedback_llm/review_manifest.json \
+  --review-corpus-output corpora/private_feedback_pilot_v1.json
+
+# Prepare the private gold-cluster CSV and reading packet. This makes no API calls.
+python -m feedback_pipeline \
+  --review-corpus ~/.feedback_llm/review_manifest.json \
+  --prepare-review-adjudication ~/.feedback_llm/adjudication/private_feedback_pilot_v1
 
 # Optional raw Gmail sidecars can be stored under:
 # /path/to/journal_reviews_inbox_2026-06-04/raw_gmail_exports/*.md
@@ -110,11 +121,28 @@ python -m feedback_pipeline \
   --review-prior-output outputs/private_review_prior.json \
   --review-prior-audit-output outputs/private_review_prior.local_audit.json
 
-# Build a whole-paper held-out review-eval plan without calling the API.
-python -m feedback_pipeline --eval-review-corpus /path/to/journal_reviews_inbox_2026-06-04 --eval-limit 3 --eval-output outputs/review_eval_plan.json
+# Estimate a cold, manuscript-only baseline without calling the API.
+python -m feedback_pipeline \
+  --eval-review-corpus ~/.feedback_llm/review_manifest.json \
+  --eval-memory-mode none \
+  --eval-output outputs/review_eval_plan.json
 
-# Paid API mode for the same held-out eval, after reviewing the dry-run cost.
-python -m feedback_pipeline --eval-review-corpus /path/to/journal_reviews_inbox_2026-06-04 --eval-limit 1 --eval-run-api
+# Paid mode requires completed, current gold labels and an explicit dollar ceiling.
+python -m feedback_pipeline \
+  --eval-review-corpus ~/.feedback_llm/review_manifest.json \
+  --eval-memory-mode none \
+  --eval-adjudication ~/.feedback_llm/adjudication/private_feedback_pilot_v1/gold_adjudication.csv \
+  --eval-max-cost-usd 15 \
+  --eval-output outputs/review_eval_baseline.json \
+  --eval-run-api
+
+# After labeling generated_adjudication.csv, finalize privacy-safe metrics offline.
+python -m feedback_pipeline \
+  --review-corpus ~/.feedback_llm/review_manifest.json \
+  --eval-adjudication ~/.feedback_llm/adjudication/private_feedback_pilot_v1/gold_adjudication.csv \
+  --eval-generated-adjudication ~/.feedback_llm/adjudication/private_feedback_pilot_v1/generated_adjudication.csv \
+  --finalize-review-eval ~/.feedback_llm/adjudication/private_feedback_pilot_v1/baseline_run.local_audit.json \
+  --eval-output outputs/review_eval_metrics.json
 
 # Compare baseline, API-safe prior, and local raw-memory upper bound.
 # Dry-run mode estimates the three-way gate cost without calling the API.
@@ -128,6 +156,7 @@ python -m feedback_pipeline \
   --eval-review-prior-gate /path/to/journal_reviews_inbox_2026-06-04 \
   --eval-limit 1 \
   --eval-output outputs/review_prior_eval_gate_api.json \
+  --eval-max-cost-usd 15 \
   --eval-run-api
 
 # OpenAI Batch API mode for the gate. This writes local JSONL batch files and
@@ -137,7 +166,37 @@ python -m feedback_pipeline \
   --eval-limit 3 \
   --eval-output outputs/review_prior_eval_gate_batch.json \
   --eval-run-api \
+  --eval-max-cost-usd 15 \
   --eval-batch-api
 ```
+
+The paid examples use illustrative ceilings. Always run the dry plan first,
+commit the exact `feedback_llm` implementation being evaluated, and approve its
+current total before making API calls.
+
+### Private Feedback Benchmark
+
+`review_manifest.schema.json` defines the private manifest. Each evaluated case
+binds one ordered manuscript bundle to one or more human-feedback sources using
+SHA-256 hashes. `family_id` is the leakage boundary; `case_id` identifies one
+reviewed manuscript version. The importer supports PDF annotations, Word
+comments, review PDFs, Markdown, text files, and Word body text. It rejects
+unsupported formats, stale hashes, empty files, dataless cloud placeholders,
+and evaluation sources labeled as AI-generated, derivative, or response material.
+
+The manifest, normalized corpus, gold labels, generated-issue labels, and local
+audit stay below `~/.feedback_llm/` with private permissions. The repository
+contains only a pseudonymous example manifest. Saved evaluation JSON is a
+path-free aggregate projection; human feedback and generated issue text remain
+in the ignored local adjudication artifacts.
+
+Gold validation has two passes. Every deduplicated cluster receives a quick
+major/minor/exclude screen. Full fields are required for every major cluster and
+for five deterministically sampled minor clusters per family (seed `20260802`).
+After a paid run, every final top-five generated issue receives manual labels for
+correctness, significance, evidence support, duplication, human-cluster match,
+and valid novelty. The paid result remains `pending_human_adjudication` until
+those labels are complete. Changing a source, extraction rule, manuscript, or
+cluster invalidates the corresponding labels.
 
 See [DESIGN.md](DESIGN.md) for implementation details.

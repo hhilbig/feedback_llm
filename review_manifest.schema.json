@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/feedback-llm/review-manifest-v1.schema.json",
+  "title": "Private human-feedback corpus manifest v1",
+  "type": "object",
+  "required": ["manifest_version", "corpus_id", "cases"],
+  "properties": {
+    "manifest_version": {"const": "v1"},
+    "corpus_id": {"$ref": "#/$defs/id"},
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/case"}
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_.-]{0,99}$"
+    },
+    "file": {
+      "type": "object",
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "role": {"$ref": "#/$defs/id"}
+      }
+    },
+    "selectors": {
+      "type": "object",
+      "properties": {
+        "pages": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "page_start": {"type": "integer", "minimum": 1},
+        "page_end": {"type": "integer", "minimum": 1},
+        "start_heading": {"type": "string", "minLength": 1},
+        "end_heading": {"type": "string", "minLength": 1},
+        "start_marker": {"type": "string", "minLength": 1},
+        "end_marker": {"type": "string", "minLength": 1},
+        "include_item_numbers": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "integer", "minimum": 1}
+        },
+        "comment_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": ["string", "integer"]}
+        },
+        "annotation_types": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "min_words": {"type": "integer", "minimum": 1}
+      },
+      "additionalProperties": false
+    },
+    "source": {
+      "allOf": [{"$ref": "#/$defs/file"}],
+      "required": [
+        "source_id",
+        "path",
+        "sha256",
+        "extractor",
+        "reviewer_id",
+        "provenance",
+        "source_type",
+        "version_match",
+        "disposition"
+      ],
+      "properties": {
+        "source_id": {"$ref": "#/$defs/id"},
+        "extractor": {
+          "enum": [
+            "pdf_annotations",
+            "pdf_text",
+            "docx_comments",
+            "docx_body",
+            "markdown",
+            "text"
+          ]
+        },
+        "reviewer_id": {"$ref": "#/$defs/id"},
+        "provenance": {"type": "string", "minLength": 1},
+        "source_type": {"type": "string", "minLength": 1},
+        "feedback_date": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}(-[0-9]{2})?$"
+        },
+        "version_match": {
+          "enum": [
+            "exact_embedded",
+            "exact_submission",
+            "version_matched",
+            "near_exact",
+            "unknown"
+          ]
+        },
+        "disposition": {"$ref": "#/$defs/disposition"},
+        "selectors": {"$ref": "#/$defs/selectors"},
+        "duplicate_group": {"$ref": "#/$defs/id"},
+        "supersedes": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/id"},
+          "uniqueItems": true
+        }
+      }
+    },
+    "disposition": {
+      "enum": ["evaluation", "deferred", "memory_only", "action_only", "exclude"]
+    },
+    "case": {
+      "type": "object",
+      "required": [
+        "family_id",
+        "case_id",
+        "benchmark_tier",
+        "manuscript_files",
+        "sources"
+      ],
+      "properties": {
+        "family_id": {"$ref": "#/$defs/id"},
+        "case_id": {"$ref": "#/$defs/id"},
+        "benchmark_tier": {"enum": ["primary", "secondary", "deferred"]},
+        "classification": {"type": "string", "minLength": 1},
+        "disposition": {"$ref": "#/$defs/disposition"},
+        "journal": {"type": "string"},
+        "decision": {"type": "string"},
+        "review_round": {"type": "string"},
+        "design_type": {"type": "string"},
+        "manuscript_files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/file"}
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/source"}
+        }
+      }
+    }
+  }
+}

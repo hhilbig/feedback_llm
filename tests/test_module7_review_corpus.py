@@ -1,10 +1,13 @@
 import json
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import feedback_pipeline as fp
+import review_corpus_manifest as rcm
 
 
 REVIEW_MD = """# AJPS - Example Difference-in-Differences Paper
@@ -157,6 +160,46 @@ def add_second_review_record(root):
 
 def json_clone(value):
     return json.loads(json.dumps(value))
+
+
+def write_manifest_case_files(root, family_id, case_id, suffix=""):
+    manuscript = root / f"manuscript{suffix}.txt"
+    feedback = root / f"feedback{suffix}.txt"
+    manuscript.write_text(
+        f"Abstract\nManuscript evidence for {case_id} uses a panel design.",
+        encoding="utf-8",
+    )
+    feedback.write_text(
+        "The reviewer asks for stronger identifying-assumption diagnostics and a falsification test.",
+        encoding="utf-8",
+    )
+    return {
+        "family_id": family_id,
+        "case_id": case_id,
+        "benchmark_tier": "primary",
+        "classification": "journal_review",
+        "disposition": "evaluation",
+        "manuscript_files": [
+            {
+                "path": manuscript.name,
+                "sha256": rcm.sha256_file(manuscript),
+                "role": "main",
+            }
+        ],
+        "sources": [
+            {
+                "source_id": f"source_{case_id}",
+                "path": feedback.name,
+                "sha256": rcm.sha256_file(feedback),
+                "extractor": "text",
+                "reviewer_id": f"reviewer_{case_id}",
+                "provenance": "human_feedback",
+                "source_type": "journal_review",
+                "version_match": "exact_submission",
+                "disposition": "evaluation",
+            }
+        ],
+    }
 
 
 def evidence_map_for(text, design_type="difference_in_differences"):
@@ -862,6 +905,36 @@ class ReviewMemoryIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reviewer_likelihood_score", result["scored"][0])
 
 
+class PrivateJsonWriterTests(unittest.TestCase):
+    def test_private_json_is_atomic_and_private_before_publish(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "private" / "result.json"
+            real_replace = os.replace
+            observed = {}
+
+            def inspect_replace(source, destination):
+                source_path = Path(source)
+                destination_path = Path(destination)
+                observed["temporary_mode"] = stat.S_IMODE(source_path.stat().st_mode)
+                observed["parent_mode"] = stat.S_IMODE(
+                    destination_path.parent.stat().st_mode
+                )
+                observed["destination_existed"] = destination_path.exists()
+                real_replace(source, destination)
+
+            with patch.object(fp.os, "replace", side_effect=inspect_replace):
+                written = fp._write_private_json(output, {"private": "payload"})
+
+            self.assertEqual(observed["temporary_mode"], 0o600)
+            self.assertEqual(observed["parent_mode"], 0o700)
+            self.assertFalse(observed["destination_existed"])
+            self.assertEqual(stat.S_IMODE(written.stat().st_mode), 0o600)
+            self.assertEqual(
+                json.loads(written.read_text(encoding="utf-8")),
+                {"private": "payload"},
+            )
+
+
 class HistoricalReviewEvalTests(unittest.IsolatedAsyncioTestCase):
     async def test_holdout_splits_exclude_heldout_paper_from_training_corpus(self):
         tmp, root = make_archive()
@@ -877,6 +950,82 @@ class HistoricalReviewEvalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(train["stats"]["heldout_records"], 1)
         self.assertFalse(any(record["paper_id"] == heldout_id for record in train["records"]))
         self.assertFalse(any(issue["paper_id"] == heldout_id for issue in train["issues"]))
+
+    async def test_manifest_loader_holds_out_every_case_in_same_family(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        manifest = {
+            "manifest_version": "v1",
+            "corpus_id": "integration_corpus",
+            "cases": [
+                write_manifest_case_files(root, "family_a", "case_a1", "_a1"),
+                write_manifest_case_files(root, "family_a", "case_a2", "_a2"),
+                write_manifest_case_files(root, "family_b", "case_b1", "_b1"),
+            ],
+        }
+        manifest_path = root / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        root.chmod(0o700)
+        for private_file in root.iterdir():
+            if private_file.is_file():
+                private_file.chmod(0o600)
+
+        with patch.object(rcm, "DEFAULT_PRIVATE_ROOT", root):
+            corpus = fp.load_review_corpus(manifest_path)
+        first_family_record = next(
+            record for record in corpus["records"] if record["family_id"] == "family_a"
+        )
+        train = fp.filter_review_corpus_for_holdout(
+            corpus,
+            first_family_record["paper_id"],
+            heldout_family_id="family_a",
+        )
+
+        self.assertTrue(corpus["manifest_version"])
+        self.assertTrue(all(issue["issue_type"] != "unclassified" for issue in corpus["issues"]))
+        self.assertFalse(any(record["family_id"] == "family_a" for record in train["records"]))
+        self.assertFalse(any(issue["family_id"] == "family_a" for issue in train["issues"]))
+        self.assertTrue(any(record["family_id"] == "family_b" for record in train["records"]))
+
+    async def test_manifest_enrichment_is_resealed_and_can_be_written_as_snapshot(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        manifest = {
+            "manifest_version": "v1",
+            "corpus_id": "enrichment_regression_corpus",
+            "cases": [
+                write_manifest_case_files(root, "family_a", "case_a1", "_a1")
+            ],
+        }
+        manifest_path = root / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        root.chmod(0o700)
+        for private_file in root.iterdir():
+            if private_file.is_file():
+                private_file.chmod(0o600)
+
+        with patch.object(rcm, "DEFAULT_PRIVATE_ROOT", root):
+            corpus = fp.load_review_corpus(manifest_path)
+            snapshot = rcm.write_private_corpus(
+                corpus,
+                "snapshots/enriched.json",
+                private_root=root,
+            )
+            reloaded = fp.load_review_corpus(snapshot)
+
+        self.assertTrue(all(issue["issue_type"] != "unclassified" for issue in corpus["issues"]))
+        self.assertEqual(reloaded, corpus)
+        self.assertEqual(stat.S_IMODE(snapshot.stat().st_mode), 0o600)
+
+        tampered = json.loads(snapshot.read_text(encoding="utf-8"))
+        tampered["issues"][0]["issue_text"] = "tampered after snapshot creation"
+        snapshot.write_text(json.dumps(tampered), encoding="utf-8")
+        snapshot.chmod(0o600)
+        with patch.object(rcm, "DEFAULT_PRIVATE_ROOT", root):
+            with self.assertRaises(rcm.ManifestValidationError):
+                fp.load_review_corpus(snapshot)
 
     async def test_eval_dry_run_estimates_cost_and_does_not_call_pipeline(self):
         tmp, root = make_archive()
@@ -901,6 +1050,7 @@ class HistoricalReviewEvalTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(output_path.exists())
         self.assertEqual(result["summary"]["mode"], "dry_run")
+        self.assertEqual(result["summary"]["memory_mode"], "none")
         self.assertEqual(result["summary"]["splits"], 1)
         self.assertGreater(result["summary"]["total_estimated_cost_usd"], 0)
         self.assertEqual(result["splits"][0]["status"], "dry_run_estimated")
@@ -913,6 +1063,314 @@ class HistoricalReviewEvalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Historical Review Evaluation", rendered)
         self.assertIn("Targets", rendered)
         self.assertIn("Clusters", rendered)
+        portable = json.loads(output_path.read_text(encoding="utf-8"))
+        self.assertEqual(portable["schema_version"], "portable_review_eval_v1")
+        self.assertNotIn(str(root), json.dumps(portable))
+        self.assertNotIn("Example Difference-in-Differences Paper", json.dumps(portable))
+
+    async def test_manifest_dry_summary_keeps_all_selected_human_issues(self):
+        corpus = {
+            "manifest_version": "v1",
+            "records": [
+                {
+                    "paper_id": "paper_short",
+                    "family_id": "family_short",
+                    "case_id": "case_short",
+                    "manifest_case": True,
+                    "review_file": "source_short",
+                    "disposition": "evaluation",
+                    "benchmark_tier": "primary",
+                    "classification": "informal_feedback",
+                    "source_type": "human_feedback",
+                    "matched_paper_files": ["manuscript.txt"],
+                    "manuscript_files": ["manuscript.txt"],
+                }
+            ],
+            "issues": [
+                {
+                    "paper_id": "paper_short",
+                    "family_id": "family_short",
+                    "case_id": "case_short",
+                    "atomic_issue_id": "short",
+                    "issue_text": "Why?",
+                    "issue_type": "other",
+                    "quality_flag": "use_for_style_only",
+                    "disposition": "evaluation",
+                }
+            ],
+            "paper_matches": {},
+            "excluded_records": [],
+            "stats": {
+                "records": 1,
+                "issues": 1,
+                "excluded_low_confidence_records": 0,
+            },
+        }
+        with (
+            patch("feedback_pipeline.load_review_corpus", return_value=corpus),
+            patch(
+                "feedback_pipeline.extract_text_from_paper_file",
+                return_value=("Abstract\nA panel design.", "ok"),
+            ),
+            patch(
+                "feedback_pipeline.estimate_cost_before_run",
+                return_value={"estimated_total_cost_usd": 1.0, "stages": {}},
+            ),
+            patch(
+                "feedback_pipeline.full_feedback_pipeline",
+                new_callable=AsyncMock,
+            ) as mock_pipeline,
+        ):
+            result = await fp.run_historical_review_eval(
+                "private_manifest.json",
+                run_api=False,
+                require_existing_pdf=False,
+            )
+
+        self.assertFalse(mock_pipeline.called)
+        self.assertEqual(result["summary"]["corpus_issue_targets"], 1)
+        self.assertEqual(result["summary"]["corpus_issue_targets_excluded"], 0)
+        self.assertEqual(result["splits"][0]["human_issue_count"], 1)
+
+    async def test_paid_eval_rejects_nonfinite_or_nonpositive_ceiling_before_api(self):
+        tmp, root = make_archive()
+        self.addCleanup(tmp.cleanup)
+        for invalid in (0.0, -1.0, float("nan"), float("inf"), float("-inf")):
+            with self.subTest(invalid=invalid):
+                with patch(
+                    "feedback_pipeline.full_feedback_pipeline",
+                    new_callable=AsyncMock,
+                ) as mock_pipeline:
+                    with self.assertRaisesRegex(ValueError, "positive finite"):
+                        await fp.run_historical_review_eval(
+                            root,
+                            run_api=True,
+                            max_cost_usd=invalid,
+                        )
+                self.assertFalse(mock_pipeline.called)
+
+        with self.assertRaisesRegex(ValueError, "positive finite"):
+            await fp.run_historical_review_eval(
+                root,
+                run_api=False,
+                max_cost_usd=float("nan"),
+            )
+
+    async def test_manifest_eval_rejects_non_five_top_k(self):
+        corpus = {
+            "manifest_version": "v1",
+            "records": [],
+            "issues": [],
+            "stats": {},
+        }
+        with patch("feedback_pipeline.load_review_corpus", return_value=corpus):
+            with self.assertRaisesRegex(ValueError, "top_k=5"):
+                await fp.run_historical_review_eval(
+                    "unused.json",
+                    run_api=False,
+                    top_k=6,
+                )
+
+    async def test_paid_manifest_eval_requires_clean_committed_worktree(self):
+        corpus = {
+            "manifest_version": "v1",
+            "records": [],
+            "issues": [],
+            "paper_matches": {},
+            "stats": {
+                "records": 0,
+                "issues": 0,
+                "excluded_low_confidence_records": 0,
+            },
+        }
+        with (
+            patch("feedback_pipeline.load_review_corpus", return_value=corpus),
+            patch("feedback_pipeline.build_review_holdout_splits", return_value=[]),
+            patch(
+                "feedback_pipeline._git_run_state",
+                return_value={"commit": "abc123", "dirty": True},
+            ),
+            patch(
+                "feedback_pipeline.full_feedback_pipeline",
+                new_callable=AsyncMock,
+            ) as mock_pipeline,
+        ):
+            with self.assertRaisesRegex(ValueError, "clean, committed"):
+                await fp.run_historical_review_eval(
+                    "private_manifest.json",
+                    run_api=True,
+                    memory_mode="none",
+                    max_cost_usd=1.0,
+                )
+
+        self.assertFalse(mock_pipeline.called)
+
+    async def test_paid_manifest_eval_rejects_partial_selection_before_api(self):
+        records = []
+        issues = []
+        for index in range(5):
+            is_secondary = index == 4
+            is_journal = index in {1, 2, 3}
+            records.append(
+                {
+                    "manifest_case": True,
+                    "disposition": "evaluation",
+                    "paper_id": f"paper_{index}",
+                    "family_id": f"family_{index}",
+                    "case_id": f"case_{index}",
+                    "review_file": f"source_{index}",
+                    "benchmark_tier": "secondary" if is_secondary else "primary",
+                    "classification": (
+                        "exact_journal_review" if is_journal else "informal_feedback"
+                    ),
+                    "journal": "journal" if is_journal else "",
+                    "source_type": "journal_review" if is_journal else "human_feedback",
+                    "matched_paper_files": [f"manuscript_{index}.txt"],
+                    "manuscript_files": [f"manuscript_{index}.txt"],
+                }
+            )
+            issues.append(
+                {
+                    "paper_id": f"paper_{index}",
+                    "family_id": f"family_{index}",
+                    "case_id": f"case_{index}",
+                    "atomic_issue_id": f"issue_{index}",
+                    "issue_text": "Why?",
+                    "issue_type": "other",
+                    "decision_tier": "unadjudicated",
+                    "quality_flag": "use_for_style_only",
+                    "disposition": "evaluation",
+                }
+            )
+        corpus = {
+            "manifest_version": "v1",
+            "records": records,
+            "issues": issues,
+            "paper_matches": {},
+            "excluded_records": [],
+            "stats": {
+                "records": 5,
+                "issues": 5,
+                "excluded_low_confidence_records": 0,
+            },
+        }
+
+        with (
+            patch("feedback_pipeline.load_review_corpus", return_value=corpus),
+            patch(
+                "feedback_pipeline._load_current_gold_adjudication",
+                return_value={"status": "ready", "pending_fields": []},
+            ),
+            patch(
+                "feedback_pipeline._git_run_state",
+                return_value={"commit": "abc123", "dirty": False},
+            ),
+            patch(
+                "feedback_pipeline.extract_text_from_paper_file",
+                return_value=("Abstract\nA panel design.", "ok"),
+            ),
+            patch(
+                "feedback_pipeline.estimate_cost_before_run",
+                return_value={"estimated_total_cost_usd": 1.0, "stages": {}},
+            ),
+            patch(
+                "feedback_pipeline.full_feedback_pipeline",
+                new_callable=AsyncMock,
+            ) as mock_pipeline,
+        ):
+            with self.assertRaisesRegex(ValueError, "complete fixed pilot"):
+                await fp.run_historical_review_eval(
+                    "private_manifest.json",
+                    run_api=True,
+                    max_splits=1,
+                    require_existing_pdf=False,
+                    memory_mode="none",
+                    max_cost_usd=100.0,
+                    adjudication_path="gold.csv",
+                )
+
+        self.assertFalse(mock_pipeline.called)
+
+    async def test_cold_eval_passes_no_feedback_or_prior_and_scores_final_top_k(self):
+        tmp, root = make_archive()
+        self.addCleanup(tmp.cleanup)
+
+        async def fake_pipeline(*args, **kwargs):
+            self.assertIsNone(kwargs.get("review_corpus"))
+            self.assertIsNone(kwargs.get("review_prior"))
+            serialized_call = json.dumps(
+                {"paper_text": args[0], "kwargs": kwargs},
+                default=str,
+            )
+            self.assertNotIn("AJPS-12345", serialized_call)
+            self.assertNotIn("Reviewer 1", serialized_call)
+            self.assertNotIn("The editor invited a revision", serialized_call)
+            self.assertNotIn(str(root), serialized_call)
+            return {
+                "selection": {
+                    "top_proposals": [
+                        {
+                            "id": 1,
+                            "text": "Problem: The DD design lacks full pre-treatment leads and a joint pre-trend test.",
+                        }
+                    ],
+                    "high_quality": [
+                        {"id": 2, "text": "Problem: This unrelated issue must not be scored."},
+                        {"id": 3, "text": "Problem: Nor should this lower-ranked issue."},
+                    ],
+                },
+                "actual_usage": {"total_cost_usd": 0.01},
+            }
+
+        with (
+            patch("feedback_pipeline.extract_text_from_paper_file") as mock_extract,
+            patch(
+                "feedback_pipeline.full_feedback_pipeline",
+                new=AsyncMock(side_effect=fake_pipeline),
+            ) as mock_pipeline,
+        ):
+            mock_extract.return_value = (
+                "Abstract\nThe paper uses difference-in-differences and discusses pre-treatment trends.",
+                "ok",
+            )
+            result = await fp.run_historical_review_eval(
+                root,
+                max_splits=1,
+                require_existing_pdf=False,
+                run_api=True,
+                memory_mode="none",
+                max_cost_usd=100.0,
+            )
+
+        self.assertEqual(mock_pipeline.await_count, 1)
+        self.assertEqual(result["summary"]["memory_mode"], "none")
+        self.assertEqual(result["splits"][0]["memory_record_count"], 0)
+        self.assertEqual(result["splits"][0]["generated_issue_count"], 1)
+        self.assertGreater(result["splits"][0]["metrics"]["major_issue_recall_at_k"], 0)
+
+    async def test_paid_eval_cost_preflight_blocks_before_pipeline_call(self):
+        tmp, root = make_archive()
+        self.addCleanup(tmp.cleanup)
+
+        with (
+            patch("feedback_pipeline.extract_text_from_paper_file") as mock_extract,
+            patch("feedback_pipeline.full_feedback_pipeline", new_callable=AsyncMock) as mock_pipeline,
+        ):
+            mock_extract.return_value = (
+                "Abstract\nThe paper uses difference-in-differences and reports treatment effects.",
+                "ok",
+            )
+            with self.assertRaisesRegex(ValueError, "exceeds max_cost_usd"):
+                await fp.run_historical_review_eval(
+                    root,
+                    max_splits=1,
+                    require_existing_pdf=False,
+                    run_api=True,
+                    memory_mode="none",
+                    max_cost_usd=0.000001,
+                )
+
+        self.assertFalse(mock_pipeline.called)
 
     async def test_eval_api_mode_uses_filtered_corpus_and_compares_to_human_issues(self):
         tmp, root = make_archive()
@@ -950,6 +1408,8 @@ class HistoricalReviewEvalTests(unittest.IsolatedAsyncioTestCase):
                 max_splits=1,
                 require_existing_pdf=False,
                 run_api=True,
+                memory_mode="local_raw",
+                max_cost_usd=100.0,
             )
 
         self.assertTrue(mock_pipeline.called)
@@ -1001,6 +1461,16 @@ class HistoricalReviewEvalTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Review Prior Evaluation Gate", rendered)
         self.assertIn("baseline", rendered)
         self.assertIn("safe_prior", rendered)
+        portable = json.loads(output_path.read_text(encoding="utf-8"))
+        serialized = json.dumps(portable)
+        self.assertEqual(
+            portable["schema_version"],
+            "portable_review_prior_eval_gate_v1",
+        )
+        self.assertNotIn(str(root), serialized)
+        self.assertNotIn("Example Difference-in-Differences Paper", serialized)
+        self.assertNotIn("matched_paper_files", serialized)
+        self.assertEqual(output_path.stat().st_mode & 0o777, 0o600)
 
     async def test_review_prior_eval_gate_batch_dry_run_discounts_estimates(self):
         tmp, root = make_archive()
@@ -1040,7 +1510,59 @@ class HistoricalReviewEvalTests(unittest.IsolatedAsyncioTestCase):
                 require_existing_pdf=False,
                 run_api=True,
                 batch_api=True,
+                max_cost_usd=100.0,
             )
+
+    async def test_review_prior_gate_checks_remaining_budget_before_each_request(self):
+        tmp, root = make_archive()
+        self.addCleanup(tmp.cleanup)
+        add_second_review_record(root)
+
+        async def fake_pipeline(*args, **kwargs):
+            return {
+                "selection": {
+                    "top_proposals": [
+                        {"id": 1, "text": "Problem: missing design diagnostic."}
+                    ]
+                },
+                "actual_usage": {"total_cost_usd": 0.45},
+            }
+
+        fake_cost = {
+            "estimated_total_cost_usd": 0.1,
+            "stages": {},
+        }
+        with (
+            patch(
+                "feedback_pipeline.extract_text_from_paper_file",
+                return_value=("Abstract\nA panel design.", "ok"),
+            ),
+            patch("feedback_pipeline.estimate_cost_before_run", return_value=fake_cost),
+            patch(
+                "feedback_pipeline.full_feedback_pipeline",
+                new=AsyncMock(side_effect=fake_pipeline),
+            ) as mock_pipeline,
+        ):
+            result = await fp.run_review_prior_eval_gate(
+                root,
+                max_splits=1,
+                require_existing_pdf=False,
+                run_api=True,
+                max_cost_usd=0.5,
+                review_prior_min_papers=1,
+                review_prior_min_comments=1,
+            )
+
+        self.assertEqual(mock_pipeline.await_count, 1)
+        self.assertEqual(
+            result["modes"]["safe_prior"]["splits"][0]["status"],
+            "skipped_cost_ceiling",
+        )
+        self.assertEqual(
+            result["modes"]["local_raw_memory"]["splits"][0]["status"],
+            "skipped_cost_ceiling",
+        )
+        self.assertEqual(result["summary"]["total_actual_cost_usd"], 0.45)
 
     async def test_review_prior_eval_gate_api_mode_compares_modes_without_leakage(self):
         tmp, root = make_archive()
@@ -1099,6 +1621,7 @@ class HistoricalReviewEvalTests(unittest.IsolatedAsyncioTestCase):
                 max_splits=1,
                 require_existing_pdf=False,
                 run_api=True,
+                max_cost_usd=100.0,
                 review_prior_min_papers=1,
                 review_prior_min_comments=1,
             )
@@ -1114,6 +1637,254 @@ class HistoricalReviewEvalTests(unittest.IsolatedAsyncioTestCase):
             result["modes"]["safe_prior"]["summary"]["mean_major_issue_cluster_recall_at_k"],
             result["modes"]["baseline"]["summary"]["mean_major_issue_cluster_recall_at_k"],
         )
+
+    async def test_review_prior_gate_rejects_nonfinite_ceiling_before_api(self):
+        tmp, root = make_archive()
+        self.addCleanup(tmp.cleanup)
+        for invalid in (0.0, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid):
+                with patch(
+                    "feedback_pipeline.full_feedback_pipeline",
+                    new_callable=AsyncMock,
+                ) as mock_pipeline:
+                    with self.assertRaisesRegex(ValueError, "positive finite"):
+                        await fp.run_review_prior_eval_gate(
+                            root,
+                            run_api=True,
+                            max_cost_usd=invalid,
+                        )
+                self.assertFalse(mock_pipeline.called)
+
+
+class ReviewEvalHardeningTests(unittest.TestCase):
+    def test_manifest_gold_screen_keeps_every_evaluation_issue(self):
+        corpus = {
+            "issues": [
+                {
+                    "atomic_issue_id": "short",
+                    "issue_text": "Why?",
+                    "issue_type": "other",
+                    "quality_flag": "use_for_style_only",
+                    "disposition": "evaluation",
+                },
+                {
+                    "atomic_issue_id": "explicitly-deferred",
+                    "issue_text": "Deferred source material.",
+                    "disposition": "deferred",
+                },
+            ]
+        }
+
+        screened = fp._manifest_evaluation_issues(corpus)
+
+        self.assertEqual(
+            [issue["atomic_issue_id"] for issue in screened],
+            ["short"],
+        )
+
+    def test_manifest_holdout_keeps_short_style_only_issue(self):
+        corpus = {
+            "manifest_version": "v1",
+            "records": [
+                {
+                    "paper_id": "paper_short",
+                    "family_id": "family_short",
+                    "case_id": "case_short",
+                    "manifest_case": True,
+                    "review_file": "source_short",
+                    "disposition": "evaluation",
+                    "benchmark_tier": "primary",
+                    "matched_paper_files": [],
+                    "manuscript_files": [],
+                }
+            ],
+            "issues": [
+                {
+                    "paper_id": "paper_short",
+                    "family_id": "family_short",
+                    "case_id": "case_short",
+                    "atomic_issue_id": "short",
+                    "issue_text": "Why?",
+                    "issue_type": "other",
+                    "quality_flag": "use_for_style_only",
+                    "disposition": "evaluation",
+                }
+            ],
+            "paper_matches": {},
+            "excluded_records": [],
+        }
+
+        splits = fp.build_review_holdout_splits(
+            corpus,
+            require_existing_pdf=False,
+        )
+
+        self.assertEqual(len(splits), 1)
+        self.assertEqual(splits[0]["human_issue_candidate_count"], 1)
+        self.assertEqual(splits[0]["human_issue_count"], 1)
+
+    def test_eval_does_not_fall_back_when_final_top_proposals_is_empty(self):
+        generated = fp._generated_issues_for_eval(
+            {
+                "selection": {
+                    "top_proposals": [],
+                    "high_quality": [{"id": "not-final"}],
+                }
+            },
+            top_k=5,
+        )
+        self.assertEqual(generated, [])
+
+    def test_portable_status_is_fixed_enum(self):
+        statuses = {
+            "ok": "ok",
+            "missing_file": "unavailable",
+            "unsupported_file_type:.rtf": "unsupported",
+            "bundle_extract_error:/private/source.pdf:permission denied": "extract_error",
+            "unexpected private detail": "unknown",
+        }
+        for raw, expected in statuses.items():
+            with self.subTest(raw=raw):
+                portable = fp.portable_review_eval_result(
+                    {
+                        "status": "pending_human_adjudication",
+                        "summary": {},
+                        "splits": [
+                            {
+                                "paper_id": "paper",
+                                "paper_text_status": raw,
+                            }
+                        ],
+                    }
+                )
+                self.assertEqual(
+                    portable["splits"][0]["paper_text_status"],
+                    expected,
+                )
+                self.assertEqual(portable["status"], "pending_human_adjudication")
+                self.assertNotIn("private", json.dumps(portable))
+
+    def test_manifest_audit_rejects_partial_and_accepts_complete_case_set(self):
+        records = [
+            {
+                "manifest_case": True,
+                "disposition": "evaluation",
+                "paper_id": f"paper_{index}",
+                "family_id": f"family_{index}",
+                "case_id": f"case_{index}",
+                "benchmark_tier": "secondary" if index == 4 else "primary",
+            }
+            for index in range(5)
+        ]
+        corpus = {
+            "manifest_version": "v1",
+            "records": records,
+            "issues": [],
+        }
+
+        def split_for(index):
+            return {
+                "paper_id": f"paper_{index}",
+                "family_id": f"family_{index}",
+                "case_id": f"case_{index}",
+                "benchmark_tier": "secondary" if index == 4 else "primary",
+                "classification": (
+                    "exact_journal_review"
+                    if index in {1, 2, 3}
+                    else "version_matched_informal_feedback"
+                ),
+                "journals": ["journal"] if index in {1, 2, 3} else [],
+                "source_types": [
+                    "journal_review" if index in {1, 2, 3} else "informal_feedback"
+                ],
+                "status": "pending_human_adjudication",
+                "paper_text_status": "ok",
+                "generated_issue_count": 5,
+            }
+
+        complete_splits = [split_for(index) for index in range(5)]
+        complete = {
+            "summary": {"api_evaluated_splits": 5},
+            "splits": complete_splits,
+            "run_metadata": {
+                "corpus_binding_hash": fp._corpus_binding_hash(corpus),
+                "top_k": 5,
+                "memory_mode": "none",
+                "benchmark_binding": fp._manifest_benchmark_binding(
+                    corpus,
+                    complete_splits,
+                ),
+            },
+        }
+        self.assertEqual(fp._manifest_baseline_audit_errors(corpus, complete), [])
+
+        partial = json_clone(complete)
+        partial["splits"] = partial["splits"][:-1]
+        partial["summary"]["api_evaluated_splits"] = 4
+        errors = fp._manifest_baseline_audit_errors(corpus, partial)
+        self.assertTrue(any("complete expected case set" in error for error in errors))
+        self.assertTrue(any("five API-evaluated" in error for error in errors))
+
+        zero_output = json_clone(complete)
+        zero_output["splits"][0]["generated_issue_count"] = 0
+        errors = fp._manifest_baseline_audit_errors(corpus, zero_output)
+        self.assertTrue(any("exactly five generated" in error for error in errors))
+
+        wrong_tiers = json_clone(complete)
+        wrong_tiers["splits"][0]["benchmark_tier"] = "secondary"
+        errors = fp._manifest_baseline_audit_errors(corpus, wrong_tiers)
+        self.assertTrue(any("four primary and one secondary" in error for error in errors))
+
+        wrong_journals = json_clone(complete)
+        wrong_journals["splits"][1]["journals"] = []
+        wrong_journals["splits"][1]["classification"] = "informal_feedback"
+        wrong_journals["splits"][1]["source_types"] = ["informal_feedback"]
+        errors = fp._manifest_baseline_audit_errors(corpus, wrong_journals)
+        self.assertTrue(any("three primary journal" in error for error in errors))
+
+    def test_cli_rejects_conflicting_modes_and_out_of_scope_flags(self):
+        cases = [
+            ["--inspect-review-corpus", "--eval-review-corpus", "corpus"],
+            ["--eval-batch-api", "--file", "paper.txt"],
+            ["--eval-run-api", "--file", "paper.txt"],
+            ["--eval-output", "result.json", "--file", "paper.txt"],
+            ["--review-corpus-output", "corpus.json", "--file", "paper.txt"],
+            ["--eval-review-corpus", "corpus.json", "--file", "paper.txt"],
+            [
+                "--eval-review-prior-gate",
+                "corpus.json",
+                "--eval-memory-mode",
+                "none",
+            ],
+        ]
+        for argv in cases:
+            with self.subTest(argv=argv):
+                with patch("sys.stderr"):
+                    with self.assertRaises(SystemExit):
+                        fp.main(argv)
+
+    def test_cli_rejects_nan_paid_ceiling(self):
+        with patch("sys.stderr"):
+            with self.assertRaises(SystemExit):
+                fp.main(
+                    [
+                        "--eval-review-corpus",
+                        "corpus.json",
+                        "--eval-run-api",
+                        "--eval-max-cost-usd",
+                        "nan",
+                    ]
+                )
+
+        with patch("sys.stderr"):
+            with self.assertRaises(SystemExit):
+                fp.main(
+                    [
+                        "--eval-review-corpus",
+                        "corpus.json",
+                        "--eval-run-api",
+                    ]
+                )
 
 
 if __name__ == "__main__":
