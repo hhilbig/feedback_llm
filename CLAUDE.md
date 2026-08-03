@@ -15,6 +15,9 @@ pip install -r requirements.txt
 # Run web app
 streamlit run streamlit_app.py
 
+# Run private, offline adjudication app
+streamlit run adjudication_app.py --server.address 127.0.0.1 --browser.gatherUsageStats false
+
 # CLI alternatives
 python3 -m feedback_pipeline --clipboard
 python3 -m feedback_pipeline --pdf paper.pdf
@@ -22,7 +25,7 @@ python3 -m feedback_pipeline --file paper.txt
 
 # Offline tests
 python3 -m unittest discover -s tests
-python3 -m py_compile feedback_pipeline.py streamlit_app.py tests/*.py
+python3 -m py_compile feedback_pipeline.py streamlit_app.py adjudication_app.py tests/*.py
 ```
 
 ## Architecture
@@ -43,7 +46,7 @@ The pipeline is mostly in `feedback_pipeline.py`:
 - **Evidence first**: Later stages cite stable evidence IDs rather than raw text spans.
 - **Prompt injection defense**: Hidden/control characters are stripped and instruction-like manuscript lines are quarantined.
 - **Structured outputs**: Evidence extraction, generation, scoring, verification, and rewrite use JSON Schema outputs.
-- **Model routing**: Defaults are `gpt-5.4-mini` for generation/scoring/verification, `gpt-5.4-nano` for rewrite/simple labeling, and `gpt-5.5` for meta-review/escalation.
+- **Model routing**: Defaults are `gpt-5.6-terra` for generation/scoring/verification, `gpt-5.6-luna` for rewrite/simple labeling, and `gpt-5.6-sol` for editorial triage/meta-review/escalation. Preserve reasoning effort at `none` for Terra/Luna and `medium` for Sol unless representative evaluations justify a change.
 - **Verification before rewrite**: The pipeline does not use a substantive critique/revision loop. Rewrite follows verification and is clarity-only.
 - **Protected minority critiques**: Severe identification, measurement/sample, and interpretation issues survive deduplication when they cite distinct evidence.
 - **Presentation-only clustering**: Clusters never merge or remove proposals.

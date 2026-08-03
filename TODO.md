@@ -12,7 +12,11 @@ have not changed in this milestone.
 The five-family source freeze is complete. All manuscript and feedback files
 are materialized, copied into the private corpus, and hash-verified. The offline
 import produces 12 human-review records, 150 issue candidates, and 145 clusters.
-The gold-adjudication packet is ready but has not been reviewed by a human.
+The gold-adjudication packet is partly complete. A human has completed 52 of 145
+cluster rows. All 36 rows that currently require full adjudication are complete;
+30 are included scoring targets, 16 are completed exclusions, and six are
+tier-screened minor rows outside the deterministic sample. The remaining 93
+rows still need a tier screen before the strict benchmark can run.
 
 The cold-baseline dry run estimated a total API cost of $9.7836 and made no API
 calls. This estimate exceeds the previously discussed $2--$3 range, so no paid
@@ -45,6 +49,9 @@ are not evaluation targets.
 8. Tests for extractors, mixed human/generated feedback, deduplication,
    family holdout, cold-run isolation, deterministic sampling, tamper detection,
    cost gates, partial-run rejection, and output privacy.
+9. An explicit partial-gold pilot mode that freezes completed labels, scores only
+   the 30 fully adjudicated included clusters, and labels major recall as
+   non-exhaustive. The strict complete-gold gate remains the default.
 
 ## Source Freeze
 
@@ -58,14 +65,18 @@ are not evaluation targets.
 
 ## Next Validation Gate
 
-1. Screen all 145 clusters in the gold packet. Complete the required fields for
-   all major clusters and the deterministic minor sample (34 full rows).
-2. Re-run the zero-call cost estimate after adjudication and obtain explicit
-   approval for the reported total. The current estimate is $9.7836.
-3. Run the paid baseline only if the completed gold packet is current and the
-   estimate is below the approved ceiling.
-4. Label every generated top-five issue, then finalize the primary,
-   journal-only, sampled-minor, precision, novelty, duplicate, and cost metrics.
+1. Re-run the zero-call estimate with `--eval-gold-mode partial` and record its
+   52/145 completed-row coverage and 30-cluster scoring denominator.
+2. Obtain explicit approval for that exact total. The previous estimate was
+   $9.7836; no paid run is authorized yet.
+3. Commit the implementation so the paid run has a clean, frozen code state.
+4. Run the partial paid pilot only if its current binding matches the dry plan
+   and the estimate is below the approved ceiling.
+5. Label every generated top-five issue, then finalize explicitly partial,
+   non-exhaustive major-recall results plus sampled-minor, precision, novelty,
+   duplicate, and cost metrics.
+6. Screen the remaining 93 rows later if an exhaustive benchmark is still worth
+   the additional labeling time.
 
 Do not change reviewer prompts, models, routing, reasoning effort, thresholds,
 or synthesis until the completed baseline has been human-adjudicated.

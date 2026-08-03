@@ -127,6 +127,15 @@ python -m feedback_pipeline \
   --eval-memory-mode none \
   --eval-output outputs/review_eval_plan.json
 
+# Estimate the explicit partial-gold pilot from completed labels only.
+# This also makes no API calls and reports completed and scoring denominators.
+python -m feedback_pipeline \
+  --eval-review-corpus ~/.feedback_llm/review_manifest.json \
+  --eval-memory-mode none \
+  --eval-adjudication ~/.feedback_llm/adjudication/private_feedback_pilot_v1/gold_adjudication.csv \
+  --eval-gold-mode partial \
+  --eval-output outputs/review_eval_partial_plan.json
+
 # Paid mode requires completed, current gold labels and an explicit dollar ceiling.
 python -m feedback_pipeline \
   --eval-review-corpus ~/.feedback_llm/review_manifest.json \
@@ -137,6 +146,7 @@ python -m feedback_pipeline \
   --eval-run-api
 
 # After labeling generated_adjudication.csv, finalize privacy-safe metrics offline.
+# Pass --eval-gold-mode partial here if the paid run used partial gold.
 python -m feedback_pipeline \
   --review-corpus ~/.feedback_llm/review_manifest.json \
   --eval-adjudication ~/.feedback_llm/adjudication/private_feedback_pilot_v1/gold_adjudication.csv \
@@ -190,13 +200,37 @@ contains only a pseudonymous example manifest. Saved evaluation JSON is a
 path-free aggregate projection; human feedback and generated issue text remain
 in the ignored local adjudication artifacts.
 
+To label the gold packet without editing CSV cells, double-click
+`run_adjudication_app.command`, or run:
+
+```bash
+streamlit run adjudication_app.py \
+  --server.address 127.0.0.1 \
+  --browser.gatherUsageStats false
+```
+
+The local app opens the current private packet, shows one cluster at a time,
+and saves only the eight adjudication fields. Start with the **Full labels**
+queue, then use **Tier screen** for the remaining quick decisions. The app makes
+no API calls and refuses files outside `~/.feedback_llm/`.
+
 Gold validation has two passes. Every deduplicated cluster receives a quick
 major/minor/exclude screen. Full fields are required for every major cluster and
 for five deterministically sampled minor clusters per family (seed `20260802`).
+Strict evaluation remains the default and requires the complete tier screen.
+`--eval-gold-mode partial` is an explicit exploratory alternative. It runs only
+after every sampled row and every row screened as major has complete labels. It
+uses fully adjudicated included rows as scoring targets, reports all completed
+screens as coverage, and never describes major-cluster recall as exhaustive.
+Changing a completed label or completing another row changes the partial binding
+and invalidates any generated-issue packet from the earlier state.
+
 After a paid run, every final top-five generated issue receives manual labels for
 correctness, significance, evidence support, duplication, human-cluster match,
 and valid novelty. The paid result remains `pending_human_adjudication` until
-those labels are complete. Changing a source, extraction rule, manuscript, or
-cluster invalidates the corresponding labels.
+those labels are complete. Manifest runs do not calculate provisional recall
+against raw feedback; scoring begins only after these manual labels are complete.
+Changing a source, extraction rule, manuscript, or cluster invalidates the
+corresponding labels.
 
 See [DESIGN.md](DESIGN.md) for implementation details.

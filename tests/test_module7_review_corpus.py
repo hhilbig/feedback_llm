@@ -1132,6 +1132,152 @@ class HistoricalReviewEvalTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["summary"]["corpus_issue_targets_excluded"], 0)
         self.assertEqual(result["splits"][0]["human_issue_count"], 1)
 
+    async def test_partial_gold_dry_run_uses_projection_and_makes_no_api_calls(self):
+        corpus = {
+            "manifest_version": "v1",
+            "records": [
+                {
+                    "paper_id": "paper_1",
+                    "family_id": "family_1",
+                    "case_id": "case_1",
+                    "manifest_case": True,
+                    "review_file": "source_1",
+                    "disposition": "evaluation",
+                    "benchmark_tier": "primary",
+                    "classification": "informal_feedback",
+                    "source_type": "human_feedback",
+                    "matched_paper_files": ["manuscript.txt"],
+                    "manuscript_files": ["manuscript.txt"],
+                }
+            ],
+            "issues": [
+                {
+                    "paper_id": "paper_1",
+                    "family_id": "family_1",
+                    "case_id": "case_1",
+                    "atomic_issue_id": "issue_1",
+                    "issue_text": "The comparison group is not credible.",
+                    "disposition": "evaluation",
+                }
+            ],
+            "paper_matches": {},
+            "excluded_records": [],
+            "stats": {
+                "records": 1,
+                "issues": 1,
+                "excluded_low_confidence_records": 0,
+            },
+        }
+        raw_gold = {
+            "status": "pending_human_adjudication",
+            "binding_hash": "source-binding",
+            "rows": [
+                {
+                    "packet_version": "feedback-llm-adjudication-v1",
+                    "binding_hash": "source-binding",
+                    "family_id": "family_1",
+                    "cluster_id": "major_1",
+                    "full_adjudication_required": "yes",
+                    "tier_screen": "major",
+                    "include": "yes",
+                    "canonical_issue": "The comparison group is not credible.",
+                    "severity": "major_revision_issue",
+                    "evidentiary_support": "supported",
+                    "duplicate_cluster_ids": "[]",
+                },
+                {
+                    "packet_version": "feedback-llm-adjudication-v1",
+                    "binding_hash": "source-binding",
+                    "family_id": "family_1",
+                    "cluster_id": "pending_1",
+                    "full_adjudication_required": "no",
+                    "tier_screen": "",
+                    "duplicate_cluster_ids": "[]",
+                },
+            ],
+        }
+        with (
+            patch("feedback_pipeline.load_review_corpus", return_value=corpus),
+            patch(
+                "feedback_pipeline._load_current_gold_adjudication",
+                return_value=raw_gold,
+            ),
+            patch(
+                "feedback_pipeline.extract_text_from_paper_file",
+                return_value=("Abstract\nA panel design.", "ok"),
+            ),
+            patch(
+                "feedback_pipeline.estimate_cost_before_run",
+                return_value={"estimated_total_cost_usd": 1.25, "stages": {}},
+            ),
+            patch(
+                "feedback_pipeline.full_feedback_pipeline",
+                new_callable=AsyncMock,
+            ) as mock_pipeline,
+            patch(
+                "review_adjudication.write_generated_adjudication_packet"
+            ) as mock_generated_packet,
+        ):
+            result = await fp.run_historical_review_eval(
+                "private_manifest.json",
+                run_api=False,
+                require_existing_pdf=False,
+                adjudication_path="gold.csv",
+                gold_mode="partial",
+            )
+
+        self.assertFalse(mock_pipeline.called)
+        self.assertFalse(mock_generated_packet.called)
+        self.assertEqual(result["status"], "dry_run")
+        self.assertEqual(result["summary"]["gold_mode"], "partial")
+        self.assertEqual(result["summary"]["evaluation_scope"], "partial_gold_pilot")
+        self.assertEqual(
+            result["summary"]["gold_coverage"]["adjudicated_cluster_count"], 1
+        )
+        self.assertEqual(result["summary"]["api_evaluated_splits"], 0)
+
+    async def test_paid_manifest_pending_gold_is_rejected_by_default_before_api(self):
+        corpus = {
+            "manifest_version": "v1",
+            "records": [],
+            "issues": [],
+            "paper_matches": {},
+            "stats": {
+                "records": 0,
+                "issues": 0,
+                "excluded_low_confidence_records": 0,
+            },
+        }
+        with (
+            patch("feedback_pipeline.load_review_corpus", return_value=corpus),
+            patch(
+                "feedback_pipeline._load_current_gold_adjudication",
+                return_value={
+                    "status": "pending_human_adjudication",
+                    "binding_hash": "source-binding",
+                    "pending_fields": ["cluster: tier_screen"],
+                    "rows": [],
+                },
+            ),
+            patch(
+                "feedback_pipeline._git_run_state",
+                return_value={"commit": "abc123", "dirty": False},
+            ),
+            patch(
+                "feedback_pipeline.full_feedback_pipeline",
+                new_callable=AsyncMock,
+            ) as mock_pipeline,
+        ):
+            with self.assertRaisesRegex(ValueError, "not ready"):
+                await fp.run_historical_review_eval(
+                    "private_manifest.json",
+                    run_api=True,
+                    max_cost_usd=10.0,
+                    adjudication_path="gold.csv",
+                )
+
+        self.assertFalse(mock_pipeline.called)
+
     async def test_paid_eval_rejects_nonfinite_or_nonpositive_ceiling_before_api(self):
         tmp, root = make_archive()
         self.addCleanup(tmp.cleanup)
@@ -1842,11 +1988,170 @@ class ReviewEvalHardeningTests(unittest.TestCase):
         errors = fp._manifest_baseline_audit_errors(corpus, wrong_journals)
         self.assertTrue(any("three primary journal" in error for error in errors))
 
+    def test_partial_finalization_uses_frozen_projection_binding_and_status(self):
+        records = [
+            {
+                "manifest_case": True,
+                "disposition": "evaluation",
+                "paper_id": f"paper_{index}",
+                "family_id": f"family_{index}",
+                "case_id": f"case_{index}",
+                "benchmark_tier": "secondary" if index == 4 else "primary",
+            }
+            for index in range(5)
+        ]
+        corpus = {
+            "manifest_version": "v1",
+            "records": records,
+            "issues": [],
+            "stats": {"records": 5, "issues": 0},
+        }
+        raw_gold = {
+            "status": "pending_human_adjudication",
+            "binding_hash": "source-binding",
+            "rows": [
+                {
+                    "packet_version": "feedback-llm-adjudication-v1",
+                    "binding_hash": "source-binding",
+                    "family_id": "family_0",
+                    "cluster_id": "major_0",
+                    "full_adjudication_required": "yes",
+                    "sampled_minor": "no",
+                    "tier_screen": "major",
+                    "include": "yes",
+                    "canonical_issue": "The comparison group is not credible.",
+                    "severity": "major_revision_issue",
+                    "evidentiary_support": "supported",
+                    "duplicate_cluster_ids": "[]",
+                },
+                {
+                    "packet_version": "feedback-llm-adjudication-v1",
+                    "binding_hash": "source-binding",
+                    "family_id": "family_0",
+                    "cluster_id": "pending_0",
+                    "full_adjudication_required": "no",
+                    "tier_screen": "",
+                    "duplicate_cluster_ids": "[]",
+                },
+            ],
+        }
+        projected = fp._gold_adjudication_for_evaluation(raw_gold, "partial")
+        generated_rows = []
+        for index in range(5):
+            for rank in range(1, 6):
+                generated_rows.append(
+                    {
+                        "family_id": f"family_{index}",
+                        "case_id": f"case_{index}",
+                        "rank": rank,
+                        "generated_issue_id": f"g_{index}_{rank}",
+                        "correctness": "correct",
+                        "significance": "significant",
+                        "evidence_sufficiency": "sufficient",
+                        "human_match_status": (
+                            "matched" if index == 0 and rank == 1 else "unmatched"
+                        ),
+                        "confirmed_human_cluster_ids": (
+                            '["major_0"]' if index == 0 and rank == 1 else "[]"
+                        ),
+                        "duplicate_status": "unique",
+                        "valid_novelty": "no",
+                    }
+                )
+        splits = [
+            {
+                "family_id": f"family_{index}",
+                "case_id": f"case_{index}",
+                "benchmark_tier": "secondary" if index == 4 else "primary",
+                "journals": ["journal"] if index in {1, 2, 3} else [],
+                "actual_usage": {"total_cost_usd": 1.0},
+            }
+            for index in range(5)
+        ]
+        local_audit = {
+            "run_metadata": {
+                "git": {"commit": "abc123", "dirty": False},
+                "routing": {},
+                "top_k": 5,
+                "memory_mode": "none",
+                "gold_mode": "partial",
+                "gold_binding_hash": projected["binding_hash"],
+                "benchmark_binding": {},
+            },
+            "generated_adjudication": {"binding_hash": "generated-binding"},
+            "splits": splits,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_path = Path(tmp) / "audit.json"
+            audit_path.write_text(json.dumps(local_audit), encoding="utf-8")
+            with (
+                patch("feedback_pipeline.load_review_corpus", return_value=corpus),
+                patch(
+                    "feedback_pipeline._load_current_gold_adjudication",
+                    return_value=raw_gold,
+                ),
+                patch(
+                    "feedback_pipeline._manifest_baseline_audit_errors",
+                    return_value=[],
+                ),
+                patch(
+                    "review_adjudication.load_generated_adjudication",
+                    return_value={"status": "ready", "rows": generated_rows},
+                ) as mock_load_generated,
+            ):
+                result = fp.finalize_review_evaluation(
+                    "manifest.json",
+                    "gold.csv",
+                    "generated.csv",
+                    audit_path,
+                    gold_mode="partial",
+                )
+
+        self.assertEqual(result["status"], "partial_gold_pilot")
+        self.assertEqual(
+            result["schema_version"], "portable_review_eval_partial_metrics_v1"
+        )
+        self.assertEqual(result["metrics"]["status"], "partial_gold_pilot")
+        self.assertEqual(
+            mock_load_generated.call_args.kwargs["expected_gold_binding_hash"],
+            projected["binding_hash"],
+        )
+        self.assertEqual(
+            mock_load_generated.call_args.kwargs["valid_gold_cluster_ids"],
+            ["major_0"],
+        )
+
+        changed_audit = json_clone(local_audit)
+        changed_audit["run_metadata"]["gold_binding_hash"] = "older-projection"
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_path = Path(tmp) / "audit.json"
+            audit_path.write_text(json.dumps(changed_audit), encoding="utf-8")
+            with (
+                patch("feedback_pipeline.load_review_corpus", return_value=corpus),
+                patch(
+                    "feedback_pipeline._load_current_gold_adjudication",
+                    return_value=raw_gold,
+                ),
+                patch(
+                    "feedback_pipeline._manifest_baseline_audit_errors",
+                    return_value=[],
+                ),
+            ):
+                with self.assertRaisesRegex(ValueError, "changed after"):
+                    fp.finalize_review_evaluation(
+                        "manifest.json",
+                        "gold.csv",
+                        "generated.csv",
+                        audit_path,
+                        gold_mode="partial",
+                    )
+
     def test_cli_rejects_conflicting_modes_and_out_of_scope_flags(self):
         cases = [
             ["--inspect-review-corpus", "--eval-review-corpus", "corpus"],
             ["--eval-batch-api", "--file", "paper.txt"],
             ["--eval-run-api", "--file", "paper.txt"],
+            ["--eval-gold-mode", "partial", "--file", "paper.txt"],
             ["--eval-output", "result.json", "--file", "paper.txt"],
             ["--review-corpus-output", "corpus.json", "--file", "paper.txt"],
             ["--eval-review-corpus", "corpus.json", "--file", "paper.txt"],

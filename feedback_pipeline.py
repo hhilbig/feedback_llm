@@ -837,6 +837,8 @@ def atomize_review_record(record: Dict[str, Any], match_info: Dict[str, Any] | N
 def load_review_corpus(
     archive_root: str | Path = DEFAULT_REVIEW_ARCHIVE_PATH,
     include_low_confidence: bool = False,
+    *,
+    private_root: str | Path | None = None,
 ) -> Dict[str, Any]:
     """Load a legacy archive directory or a validated private manifest/snapshot."""
     root = Path(archive_root).expanduser()
@@ -857,7 +859,7 @@ def load_review_corpus(
             raise ManifestValidationError(
                 "review-corpus JSON is neither a manifest v1 nor a normalized private snapshot"
             )
-        corpus = build_review_corpus_from_manifest(root)
+        corpus = build_review_corpus_from_manifest(root, private_root=private_root)
         if manifest_input:
             for issue in corpus.get("issues", []):
                 text = issue.get("issue_text", "")
@@ -3557,6 +3559,8 @@ def prepare_review_adjudication(
 def _load_current_gold_adjudication(
     corpus: Dict[str, Any],
     adjudication_path: str | Path,
+    *,
+    private_root: str | Path | None = None,
 ) -> Dict[str, Any]:
     from review_adjudication import cluster_normalized_issues, load_gold_adjudication
 
@@ -3569,7 +3573,22 @@ def _load_current_gold_adjudication(
         adjudication_path,
         clusters=clusters,
         binding_context=_adjudication_binding_context(corpus),
+        private_root=private_root,
     )
+
+
+def _gold_adjudication_for_evaluation(
+    gold_validation: Dict[str, Any],
+    gold_mode: str,
+) -> Dict[str, Any]:
+    """Return the strict gold packet or a hash-bound completed-row projection."""
+    if gold_mode == "complete":
+        return gold_validation
+    if gold_mode == "partial":
+        from review_adjudication import project_partial_gold_adjudication
+
+        return project_partial_gold_adjudication(gold_validation)
+    raise ValueError("gold_mode must be one of: complete, partial")
 
 
 def finalize_review_evaluation(
@@ -3578,12 +3597,19 @@ def finalize_review_evaluation(
     generated_adjudication_path: str | Path,
     local_audit_path: str | Path,
     output_path: str | Path | None = None,
+    gold_mode: str = "complete",
 ) -> Dict[str, Any]:
     """Validate both manual packets and compute text-free aggregate metrics."""
     corpus = load_review_corpus(corpus_path)
     if not corpus.get("manifest_version"):
         raise ValueError("Final baseline metrics require a manifest corpus")
-    gold = _load_current_gold_adjudication(corpus, gold_adjudication_path)
+    raw_gold = _load_current_gold_adjudication(corpus, gold_adjudication_path)
+    gold = _gold_adjudication_for_evaluation(raw_gold, gold_mode)
+    if gold.get("status") != "ready":
+        raise ValueError(
+            "Gold adjudication is not ready for finalization "
+            f"(status={gold.get('status', 'missing')})"
+        )
     audit_path = Path(local_audit_path).expanduser()
     local_audit = json.loads(audit_path.read_text(encoding="utf-8"))
     audit_errors = _manifest_baseline_audit_errors(corpus, local_audit)
@@ -3592,12 +3618,25 @@ def finalize_review_evaluation(
             "Baseline run is incomplete or stale: " + "; ".join(audit_errors)
         )
     run_metadata = local_audit.get("run_metadata", {})
+    recorded_gold_mode = str(run_metadata.get("gold_mode", "complete"))
+    if recorded_gold_mode != gold_mode:
+        raise ValueError(
+            "Baseline gold mode does not match finalization request "
+            f"(run={recorded_gold_mode}, requested={gold_mode})"
+        )
+    recorded_gold_binding = str(run_metadata.get("gold_binding_hash", ""))
+    if recorded_gold_binding and recorded_gold_binding != gold.get("binding_hash"):
+        raise ValueError(
+            "Gold adjudication changed after the baseline run; regenerate the "
+            "generated-adjudication packet."
+        )
     run_context = {
         "corpus_binding_hash": _corpus_binding_hash(corpus),
         "git_commit": run_metadata.get("git", {}).get("commit", "unknown"),
         "routing": run_metadata.get("routing", {}),
         "top_k": run_metadata.get("top_k", 5),
         "memory_mode": run_metadata.get("memory_mode", "none"),
+        "gold_mode": gold_mode,
         "benchmark_binding": run_metadata.get("benchmark_binding", {}),
     }
     from review_adjudication import (
@@ -3661,11 +3700,18 @@ def finalize_review_evaluation(
         cost_by_family=cost_by_family,
         top_k=REVIEW_BASELINE_TOP_K,
     )
-    if metrics.get("status") != "complete":
+    expected_metric_status = (
+        "partial_gold_pilot" if gold_mode == "partial" else "complete"
+    )
+    if metrics.get("status") != expected_metric_status:
         raise ValueError("Final metrics remain pending human adjudication")
     result = {
-        "status": "complete",
-        "schema_version": "portable_review_eval_metrics_v1",
+        "status": expected_metric_status,
+        "schema_version": (
+            "portable_review_eval_partial_metrics_v1"
+            if gold_mode == "partial"
+            else "portable_review_eval_metrics_v1"
+        ),
         "corpus_binding_hash": _corpus_binding_hash(corpus),
         "run_metadata": run_metadata,
         "metrics": metrics,
@@ -3728,6 +3774,8 @@ def _review_eval_run_metadata(
     top_k: int,
     memory_mode: str,
     splits: List[Dict[str, Any]] | None = None,
+    gold_mode: str = "complete",
+    gold_validation: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     routing_models = dict(routing.__dict__)
     role_counts = Counter(role for role, _ in BASE_PERSONA_DECK)
@@ -3748,8 +3796,16 @@ def _review_eval_run_metadata(
         "importance_threshold": IMPORTANCE_THRESHOLD,
         "composite_threshold": COMPOSITE_THRESHOLD,
         "memory_mode": memory_mode,
+        "gold_mode": gold_mode,
         "corpus_binding_hash": _corpus_binding_hash(corpus),
     }
+    if gold_validation is not None:
+        metadata["gold_binding_hash"] = gold_validation.get("binding_hash", "")
+        metadata["gold_evaluation_scope"] = gold_validation.get(
+            "evaluation_scope", "complete_gold_benchmark"
+        )
+        if gold_validation.get("coverage"):
+            metadata["gold_coverage"] = dict(gold_validation["coverage"])
     if corpus.get("manifest_version"):
         metadata["benchmark_binding"] = _manifest_benchmark_binding(
             corpus,
@@ -3970,6 +4026,7 @@ async def run_historical_review_eval(
     memory_mode: str = "none",
     max_cost_usd: float | None = None,
     adjudication_path: str | Path | None = None,
+    gold_mode: str = "complete",
 ) -> Dict[str, Any]:
     """Plan or run whole-paper historical-review evaluation.
 
@@ -3979,6 +4036,8 @@ async def run_historical_review_eval(
     """
     if memory_mode not in {"none", "local_raw"}:
         raise ValueError("memory_mode must be one of: none, local_raw")
+    if gold_mode not in {"complete", "partial"}:
+        raise ValueError("gold_mode must be one of: complete, partial")
     if max_cost_usd is not None:
         max_cost_usd = _require_positive_finite_cost_ceiling(
             max_cost_usd,
@@ -4002,6 +4061,7 @@ async def run_historical_review_eval(
             routing=routing,
             memory_mode=memory_mode,
             adjudication_path=adjudication_path,
+            gold_mode=gold_mode,
         )
         preflight_cost = float(
             preflight.get("summary", {}).get("total_estimated_cost_usd", 0.0)
@@ -4014,6 +4074,8 @@ async def run_historical_review_eval(
 
     routing = routing or build_model_routing(gen_model=gen_model)
     corpus = load_review_corpus(archive_root, include_low_confidence=include_low_confidence)
+    if gold_mode == "partial" and not corpus.get("manifest_version"):
+        raise ValueError("Partial-gold evaluation requires a private manifest corpus")
     if corpus.get("manifest_version") and top_k != REVIEW_BASELINE_TOP_K:
         raise ValueError("Manifest baseline evaluation requires top_k=5")
     if run_api and corpus.get("manifest_version"):
@@ -4022,9 +4084,17 @@ async def run_historical_review_eval(
             raise ValueError(
                 "Paid manifest evaluation requires a clean, committed feedback_llm worktree"
             )
+    raw_gold_validation: Dict[str, Any] | None = None
     gold_validation: Dict[str, Any] | None = None
     if corpus.get("manifest_version") and adjudication_path:
-        gold_validation = _load_current_gold_adjudication(corpus, adjudication_path)
+        raw_gold_validation = _load_current_gold_adjudication(corpus, adjudication_path)
+        gold_validation = _gold_adjudication_for_evaluation(
+            raw_gold_validation, gold_mode
+        )
+    if corpus.get("manifest_version") and gold_mode == "partial" and not adjudication_path:
+        raise ValueError(
+            "Partial-gold evaluation requires --eval-adjudication, including in dry-run mode"
+        )
     if run_api and corpus.get("manifest_version"):
         if not adjudication_path:
             raise ValueError(
@@ -4149,7 +4219,6 @@ async def run_historical_review_eval(
                 review_prior=None,
             )
             generated = _generated_issues_for_eval(pipeline_result, top_k=top_k)
-            human_issues = issues_by_paper.get(case_id, issues_by_paper.get(paper_id, []))
             for rank, issue in enumerate(generated, start=1):
                 adjudication_issue = dict(issue)
                 adjudication_issue.update(
@@ -4172,11 +4241,15 @@ async def run_historical_review_eval(
                 }
                 for issue in generated
             ]
-            item["metrics"] = compare_generated_to_human_issues(
-                generated,
-                human_issues,
-                top_k=top_k,
-            )
+            if not corpus.get("manifest_version"):
+                human_issues = issues_by_paper.get(
+                    case_id, issues_by_paper.get(paper_id, [])
+                )
+                item["metrics"] = compare_generated_to_human_issues(
+                    generated,
+                    human_issues,
+                    top_k=top_k,
+                )
             item["actual_usage"] = pipeline_result.get("actual_usage", {})
             actual_case_cost = float(
                 item["actual_usage"].get("total_cost_usd", estimated_case_cost)
@@ -4197,7 +4270,14 @@ async def run_historical_review_eval(
 
         split_results.append(item)
 
-    evaluated = [item for item in split_results if item.get("metrics")]
+    evaluated_with_legacy_metrics = [
+        item for item in split_results if item.get("metrics")
+    ]
+    api_evaluated = [
+        item
+        for item in split_results
+        if item.get("status") in {"api_evaluated", "pending_human_adjudication"}
+    ]
     if corpus.get("manifest_version"):
         corpus_target_issues = _manifest_evaluation_issues(corpus)
         corpus_excluded_targets = [
@@ -4213,9 +4293,15 @@ async def run_historical_review_eval(
         "archive_root": str(archive_root),
         "mode": "api" if run_api else "dry_run",
         "memory_mode": memory_mode,
+        "gold_mode": gold_mode,
+        "evaluation_scope": (
+            gold_validation.get("evaluation_scope", "complete_gold_benchmark")
+            if gold_validation is not None
+            else "not_loaded"
+        ),
         "max_cost_usd": max_cost_usd,
         "splits": len(split_results),
-        "api_evaluated_splits": len(evaluated),
+        "api_evaluated_splits": len(api_evaluated),
         "extractable_splits": sum(1 for item in split_results if item.get("paper_text_status") == "ok"),
         "total_estimated_cost_usd": round(total_estimated_cost, 6),
         "total_actual_cost_usd": round(actual_spend_usd, 6),
@@ -4226,36 +4312,63 @@ async def run_historical_review_eval(
         "corpus_issue_target_exclusion_reasons": _target_exclusion_reason_counts(corpus_excluded_targets),
         "low_confidence_records_excluded": corpus["stats"]["excluded_low_confidence_records"],
     }
-    if evaluated:
+    if gold_validation and gold_validation.get("coverage"):
+        summary["gold_coverage"] = dict(gold_validation["coverage"])
+    if evaluated_with_legacy_metrics:
         summary["mean_human_issue_recall_at_k"] = round(
-            sum(item["metrics"]["human_issue_recall_at_k"] for item in evaluated) / len(evaluated),
+            sum(
+                item["metrics"]["human_issue_recall_at_k"]
+                for item in evaluated_with_legacy_metrics
+            )
+            / len(evaluated_with_legacy_metrics),
             4,
         )
         summary["mean_major_issue_recall_at_k"] = round(
-            sum(item["metrics"]["major_issue_recall_at_k"] for item in evaluated) / len(evaluated),
+            sum(
+                item["metrics"]["major_issue_recall_at_k"]
+                for item in evaluated_with_legacy_metrics
+            )
+            / len(evaluated_with_legacy_metrics),
             4,
         )
         summary["mean_human_issue_cluster_recall_at_k"] = round(
-            sum(item["metrics"]["human_issue_cluster_recall_at_k"] for item in evaluated) / len(evaluated),
+            sum(
+                item["metrics"]["human_issue_cluster_recall_at_k"]
+                for item in evaluated_with_legacy_metrics
+            )
+            / len(evaluated_with_legacy_metrics),
             4,
         )
         summary["mean_major_issue_cluster_recall_at_k"] = round(
-            sum(item["metrics"]["major_issue_cluster_recall_at_k"] for item in evaluated) / len(evaluated),
+            sum(
+                item["metrics"]["major_issue_cluster_recall_at_k"]
+                for item in evaluated_with_legacy_metrics
+            )
+            / len(evaluated_with_legacy_metrics),
             4,
         )
         summary["mean_reviewer_likelihood_precision_at_k"] = round(
-            sum(item["metrics"]["reviewer_likelihood_precision_at_k"] for item in evaluated) / len(evaluated),
+            sum(
+                item["metrics"]["reviewer_likelihood_precision_at_k"]
+                for item in evaluated_with_legacy_metrics
+            )
+            / len(evaluated_with_legacy_metrics),
             4,
         )
         summary["mean_deduplicated_reviewer_likelihood_precision_at_k"] = round(
             sum(
                 item["metrics"]["deduplicated_reviewer_likelihood_precision_at_k"]
-                for item in evaluated
-            ) / len(evaluated),
+                for item in evaluated_with_legacy_metrics
+            )
+            / len(evaluated_with_legacy_metrics),
             4,
         )
         summary["mean_duplicate_generated_cluster_matches"] = round(
-            sum(item["metrics"]["duplicate_generated_cluster_matches"] for item in evaluated) / len(evaluated),
+            sum(
+                item["metrics"]["duplicate_generated_cluster_matches"]
+                for item in evaluated_with_legacy_metrics
+            )
+            / len(evaluated_with_legacy_metrics),
             4,
         )
 
@@ -4274,13 +4387,19 @@ async def run_historical_review_eval(
             top_k=top_k,
             memory_mode=memory_mode,
             splits=splits,
+            gold_mode=gold_mode,
+            gold_validation=gold_validation,
         ),
     }
     if gold_validation is not None:
         result["gold_adjudication"] = {
             "status": gold_validation.get("status"),
+            "source_status": (raw_gold_validation or {}).get("status"),
+            "gold_mode": gold_mode,
+            "evaluation_scope": gold_validation.get("evaluation_scope"),
             "binding_hash": gold_validation.get("binding_hash", ""),
             "pending_fields": len(gold_validation.get("pending_fields", [])),
+            "coverage": dict(gold_validation.get("coverage", {})),
         }
     if run_api and corpus.get("manifest_version"):
         from review_adjudication import write_generated_adjudication_packet
@@ -4304,6 +4423,7 @@ async def run_historical_review_eval(
                     "routing": result["run_metadata"]["routing"],
                     "top_k": REVIEW_BASELINE_TOP_K,
                     "memory_mode": memory_mode,
+                    "gold_mode": gold_mode,
                     "benchmark_binding": result["run_metadata"].get(
                         "benchmark_binding", {}
                     ),
@@ -4683,6 +4803,8 @@ def render_historical_review_eval_summary(result: Dict[str, Any]) -> str:
         "",
         f"- Mode: {summary.get('mode', 'dry_run')}",
         f"- Review-memory mode: {summary.get('memory_mode', 'local_raw')}",
+        f"- Gold mode: {summary.get('gold_mode', 'complete')}",
+        f"- Evaluation scope: {summary.get('evaluation_scope', 'not_loaded')}",
         f"- Corpus records: {summary.get('corpus_records', 0)}",
         f"- Corpus issue candidates: {summary.get('corpus_issue_candidates', 0)}",
         f"- Corpus scored issue targets: {summary.get('corpus_issue_targets', 0)}",
@@ -4693,11 +4815,25 @@ def render_historical_review_eval_summary(result: Dict[str, Any]) -> str:
         f"- API-evaluated splits: {summary.get('api_evaluated_splits', 0)}",
         f"- Estimated total API cost: ${summary.get('total_estimated_cost_usd', 0.0):.4f}",
     ]
+    coverage = summary.get("gold_coverage", {})
+    if coverage:
+        lines.extend(
+            [
+                "- Gold rows completed: "
+                f"{coverage.get('adjudicated_cluster_count', 0)}/"
+                f"{coverage.get('total_cluster_count', 0)}",
+                "- Fully adjudicated scoring clusters: "
+                f"{coverage.get('eligible_scoring_cluster_count', 0)}",
+                "- Exhaustive major recall available: no"
+                if summary.get("gold_mode") == "partial"
+                else "- Exhaustive major recall available: yes",
+            ]
+        )
     if summary.get("mode") == "api":
         lines.append(
             f"- Actual API cost recorded: ${summary.get('total_actual_cost_usd', 0.0):.4f}"
         )
-    if summary.get("api_evaluated_splits"):
+    if "mean_human_issue_recall_at_k" in summary:
         lines.extend(
             [
                 f"- Mean human issue recall@K: {summary.get('mean_human_issue_recall_at_k', 0.0):.4f}",
@@ -9698,6 +9834,15 @@ def main(argv: List[str] | None = None) -> int:
         help="Completed, hash-bound gold-adjudication CSV for paid manifest evaluation.",
     )
     parser.add_argument(
+        "--eval-gold-mode",
+        choices=("complete", "partial"),
+        default="complete",
+        help=(
+            "Gold-label gate: complete requires the full tier screen; partial "
+            "uses a hash-bound completed-row projection and reports non-exhaustive metrics."
+        ),
+    )
+    parser.add_argument(
         "--eval-generated-adjudication",
         type=str,
         default=None,
@@ -9787,6 +9932,12 @@ def main(argv: List[str] | None = None) -> int:
         )
     if option_was_used("--eval-memory-mode") and not args.eval_review_corpus:
         parser.error("--eval-memory-mode is only valid with --eval-review-corpus")
+    if option_was_used("--eval-gold-mode") and not (
+        args.eval_review_corpus or args.finalize_review_eval
+    ):
+        parser.error(
+            "--eval-gold-mode requires --eval-review-corpus or --finalize-review-eval"
+        )
     if args.eval_adjudication and not (
         args.eval_review_corpus or args.finalize_review_eval
     ):
@@ -9852,6 +10003,7 @@ def main(argv: List[str] | None = None) -> int:
                 args.eval_generated_adjudication,
                 args.finalize_review_eval,
                 output_path=args.eval_output,
+                gold_mode=args.eval_gold_mode,
             )
         except (FileNotFoundError, OSError, ValueError, json.JSONDecodeError) as e:
             print(f"Review eval finalization error: {e}", file=sys.stderr)
@@ -10020,6 +10172,7 @@ def main(argv: List[str] | None = None) -> int:
                     memory_mode=args.eval_memory_mode,
                     max_cost_usd=args.eval_max_cost_usd,
                     adjudication_path=args.eval_adjudication,
+                    gold_mode=args.eval_gold_mode,
                 )
             )
         except (FileNotFoundError, OSError, ValueError) as e:

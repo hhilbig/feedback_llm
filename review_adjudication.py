@@ -21,8 +21,9 @@ import re
 import stat
 import tempfile
 from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Mapping, Sequence, Tuple
 
 
 PACKET_VERSION = "feedback-llm-adjudication-v1"
@@ -88,6 +89,20 @@ GOLD_COLUMNS = [
     "adjudicator_notes",
 ]
 
+GOLD_EDITABLE_COLUMNS = (
+    "tier_screen",
+    "include",
+    "canonical_issue",
+    "severity",
+    "evidentiary_support",
+    "duplicate_cluster_ids",
+    "exclusion_reason",
+    "adjudicator_notes",
+)
+GOLD_IMMUTABLE_COLUMNS = tuple(
+    column for column in GOLD_COLUMNS if column not in GOLD_EDITABLE_COLUMNS
+)
+
 GENERATED_COLUMNS = [
     "packet_version",
     "binding_hash",
@@ -112,6 +127,8 @@ GENERATED_COLUMNS = [
     "valid_novelty",
     "adjudicator_notes",
 ]
+
+PARTIAL_GOLD_BINDING_VERSION = "feedback-llm-partial-gold-v1"
 
 
 def _canonical_json(value: Any) -> str:
@@ -435,6 +452,18 @@ def _parse_json_cell(value: Any, default: Any) -> Any:
         return default
 
 
+def _parse_json_list_cell(value: Any) -> tuple[List[Any], bool]:
+    """Return a JSON list and whether the original cell was valid JSON-list data."""
+    text = str(value or "").strip()
+    if not text:
+        return [], True
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return [], False
+    return (parsed, True) if isinstance(parsed, list) else ([], False)
+
+
 def _private_root_path(private_root: str | Path | None = None) -> Path:
     return Path(private_root or DEFAULT_PRIVATE_ROOT).expanduser().resolve()
 
@@ -687,6 +716,142 @@ def _read_csv(
         return [dict(row) for row in csv.DictReader(handle)]
 
 
+def gold_row_requirements(
+    row: Mapping[str, Any],
+    *,
+    family_by_cluster: Mapping[str, str] | None = None,
+) -> Dict[str, Any]:
+    """Return the conditional requirements and completion state for one gold row."""
+    cluster_id = _clean(row.get("cluster_id")) or "<missing>"
+    family_id = _clean(row.get("family_id"))
+    known_families = dict(family_by_cluster or {cluster_id: family_id})
+    pending: List[str] = []
+    errors: List[str] = []
+
+    duplicate_ids, duplicates_valid = _parse_json_list_cell(
+        row.get("duplicate_cluster_ids")
+    )
+    if not duplicates_valid:
+        errors.append("duplicate_cluster_ids must be a JSON list")
+    else:
+        for duplicate_id in map(str, duplicate_ids):
+            if duplicate_id == cluster_id:
+                errors.append("cannot list itself as a duplicate")
+            elif duplicate_id not in known_families:
+                errors.append(f"duplicate cluster does not exist: {duplicate_id}")
+            elif known_families[duplicate_id] != family_id:
+                errors.append("duplicate cluster must be in the same family")
+
+    tier = _clean(row.get("tier_screen")).lower()
+    tier_screened = tier in TIER_SCREEN_VALUES
+    full_required = (
+        _clean(row.get("full_adjudication_required")).lower() == "yes"
+        or tier == "major"
+    )
+    if not tier_screened:
+        pending.append("tier_screen")
+    else:
+        include = _clean(row.get("include")).lower()
+        if tier == "exclude":
+            if include != "no":
+                pending.append("include=no")
+            if not _clean(row.get("exclusion_reason")):
+                pending.append("exclusion_reason")
+        elif full_required:
+            if include not in INCLUDE_VALUES:
+                pending.append("include")
+            elif include == "no":
+                if not _clean(row.get("exclusion_reason")):
+                    pending.append("exclusion_reason")
+            else:
+                if not _clean(row.get("canonical_issue")):
+                    pending.append("canonical_issue")
+                severity = _clean(row.get("severity"))
+                if severity not in SEVERITY_VALUES:
+                    pending.append("severity")
+                elif tier == "major" and severity not in {
+                    "potential_rejection_reason",
+                    "major_revision_issue",
+                }:
+                    errors.append("major tier requires major severity")
+                elif tier == "minor" and severity not in {
+                    "minor_revision_issue",
+                    "nice_to_have",
+                }:
+                    errors.append("minor tier requires minor severity")
+                if _clean(row.get("evidentiary_support")) not in SUPPORT_VALUES:
+                    pending.append("evidentiary_support")
+
+    return {
+        "cluster_id": cluster_id,
+        "tier": tier,
+        "tier_screened": tier_screened,
+        "full_required": full_required,
+        "pending_fields": pending,
+        "errors": errors,
+        "complete": not pending and not errors,
+    }
+
+
+def gold_adjudication_progress(
+    rows: Sequence[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    """Summarize tier-screen and full-label progress for the adjudication UI."""
+    family_by_cluster = {
+        _clean(row.get("cluster_id")): _clean(row.get("family_id")) for row in rows
+    }
+    states = [
+        gold_row_requirements(row, family_by_cluster=family_by_cluster) for row in rows
+    ]
+    families: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"total": 0, "tier_done": 0, "full_total": 0, "full_done": 0, "remaining": 0}
+    )
+    for row, state in zip(rows, states):
+        family = _clean(row.get("family_id"))
+        family_progress = families[family]
+        family_progress["total"] += 1
+        family_progress["tier_done"] += int(state["tier_screened"])
+        family_progress["full_total"] += int(state["full_required"])
+        family_progress["full_done"] += int(
+            state["full_required"] and state["complete"]
+        )
+        family_progress["remaining"] += int(not state["complete"])
+    return {
+        "total": len(rows),
+        "tier_done": sum(int(state["tier_screened"]) for state in states),
+        "full_total": sum(int(state["full_required"]) for state in states),
+        "full_done": sum(
+            int(state["full_required"] and state["complete"]) for state in states
+        ),
+        "complete": sum(int(state["complete"]) for state in states),
+        "remaining": sum(int(not state["complete"]) for state in states),
+        "families": {family: dict(values) for family, values in sorted(families.items())},
+    }
+
+
+def eligible_duplicate_clusters(
+    rows: Sequence[Mapping[str, Any]],
+    cluster_id: str,
+) -> List[Dict[str, Any]]:
+    """Return same-family duplicate candidates, excluding the current cluster."""
+    current = next(
+        (row for row in rows if _clean(row.get("cluster_id")) == cluster_id),
+        None,
+    )
+    if current is None:
+        raise ValueError(f"Unknown cluster_id: {cluster_id}")
+    family_id = _clean(current.get("family_id"))
+    return sorted(
+        [
+            dict(row)
+            for row in rows
+            if _clean(row.get("family_id")) == family_id
+            and _clean(row.get("cluster_id")) != cluster_id
+        ],
+        key=lambda row: _clean(row.get("cluster_id")),
+    )
+
+
 def validate_gold_rows(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -723,56 +888,10 @@ def validate_gold_rows(
     }
 
     for row in rows:
-        cluster_id = _clean(row.get("cluster_id")) or "<missing>"
-        duplicate_ids = _parse_json_cell(row.get("duplicate_cluster_ids"), [])
-        if not isinstance(duplicate_ids, list):
-            errors.append(f"{cluster_id}: duplicate_cluster_ids must be a JSON list")
-        else:
-            for duplicate_id in map(str, duplicate_ids):
-                if duplicate_id == cluster_id:
-                    errors.append(f"{cluster_id}: cannot list itself as a duplicate")
-                elif duplicate_id not in family_by_cluster:
-                    errors.append(f"{cluster_id}: duplicate cluster does not exist: {duplicate_id}")
-                elif family_by_cluster[duplicate_id] != family_by_cluster.get(cluster_id):
-                    errors.append(f"{cluster_id}: duplicate cluster must be in the same family")
-        tier = _clean(row.get("tier_screen")).lower()
-        if tier not in TIER_SCREEN_VALUES:
-            pending.append(f"{cluster_id}: tier_screen")
-            continue
-        full_required = (
-            _clean(row.get("full_adjudication_required")).lower() == "yes"
-            or tier == "major"
-        )
-        include = _clean(row.get("include")).lower()
-        if tier == "exclude":
-            if include != "no":
-                pending.append(f"{cluster_id}: include=no")
-            if not _clean(row.get("exclusion_reason")):
-                pending.append(f"{cluster_id}: exclusion_reason")
-            continue
-        if not full_required:
-            continue
-        if include not in INCLUDE_VALUES:
-            pending.append(f"{cluster_id}: include")
-            continue
-        if include == "no":
-            if not _clean(row.get("exclusion_reason")):
-                pending.append(f"{cluster_id}: exclusion_reason")
-            continue
-        if not _clean(row.get("canonical_issue")):
-            pending.append(f"{cluster_id}: canonical_issue")
-        severity = _clean(row.get("severity"))
-        if severity not in SEVERITY_VALUES:
-            pending.append(f"{cluster_id}: severity")
-        elif tier == "major" and severity not in {
-            "potential_rejection_reason",
-            "major_revision_issue",
-        }:
-            errors.append(f"{cluster_id}: major tier requires major severity")
-        elif tier == "minor" and severity not in {"minor_revision_issue", "nice_to_have"}:
-            errors.append(f"{cluster_id}: minor tier requires minor severity")
-        if _clean(row.get("evidentiary_support")) not in SUPPORT_VALUES:
-            pending.append(f"{cluster_id}: evidentiary_support")
+        state = gold_row_requirements(row, family_by_cluster=family_by_cluster)
+        cluster_id = state["cluster_id"]
+        pending.extend(f"{cluster_id}: {field}" for field in state["pending_fields"])
+        errors.extend(f"{cluster_id}: {error}" for error in state["errors"])
 
     if stale:
         status = "stale"
@@ -874,6 +993,268 @@ def load_gold_adjudication(
     return result
 
 
+def project_partial_gold_adjudication(
+    gold_validation: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Freeze the currently completed gold rows for an exploratory pilot.
+
+    This projection never treats an incomplete tier screen as negative evidence.
+    It is allowed only when every row selected for full adjudication, including
+    rows promoted to ``major`` during screening, is complete.  The derived
+    binding covers both the source-bound packet and every scoring-relevant label
+    in the selected rows, so later labeling changes invalidate generated work.
+    """
+    source_status = _clean(gold_validation.get("status"))
+    if source_status in {"stale", "invalid"}:
+        raise ValueError(
+            "Partial-gold evaluation requires a current, valid adjudication "
+            f"packet (status={source_status})."
+        )
+    if source_status not in {"ready", "pending_human_adjudication"}:
+        raise ValueError(
+            "Partial-gold evaluation requires a loaded adjudication packet "
+            f"(status={source_status or 'missing'})."
+        )
+
+    rows = [dict(row) for row in gold_validation.get("rows", [])]
+    if not rows:
+        raise ValueError("Partial-gold evaluation requires at least one gold row.")
+    family_by_cluster = {
+        _clean(row.get("cluster_id")): _clean(row.get("family_id")) for row in rows
+    }
+    states = [
+        gold_row_requirements(row, family_by_cluster=family_by_cluster) for row in rows
+    ]
+    invalid_rows = [
+        state["cluster_id"] for state in states if state.get("errors")
+    ]
+    if invalid_rows:
+        raise ValueError(
+            "Partial-gold evaluation cannot use invalid rows: "
+            + ", ".join(sorted(invalid_rows))
+        )
+    incomplete_full = [
+        state["cluster_id"]
+        for state in states
+        if state["full_required"] and not state["complete"]
+    ]
+    if incomplete_full:
+        raise ValueError(
+            "Partial-gold evaluation requires every full-adjudication row and "
+            "promoted major to be complete "
+            f"({len(incomplete_full)} incomplete)."
+        )
+
+    completed_rows = sorted(
+        [row for row, state in zip(rows, states) if state["complete"]],
+        key=lambda row: (_clean(row.get("family_id")), _clean(row.get("cluster_id"))),
+    )
+    if not completed_rows:
+        raise ValueError("Partial-gold evaluation has no completed rows to score.")
+    scoring_rows = [
+        row
+        for row in completed_rows
+        if (
+            _clean(row.get("full_adjudication_required")).lower() == "yes"
+            or _clean(row.get("tier_screen")).lower() == "major"
+        )
+        and _clean(row.get("include")).lower() == "yes"
+    ]
+    if not scoring_rows:
+        raise ValueError(
+            "Partial-gold evaluation has no fully adjudicated included rows to score."
+        )
+    scoring_ids = {_clean(row.get("cluster_id")) for row in scoring_rows}
+    for row in scoring_rows:
+        duplicate_ids = _parse_json_cell(row.get("duplicate_cluster_ids"), [])
+        unavailable = sorted(set(map(str, duplicate_ids or [])) - scoring_ids)
+        if unavailable:
+            raise ValueError(
+                "Partial-gold duplicate links must point to scoring rows "
+                f"({_clean(row.get('cluster_id'))}: {', '.join(unavailable)})."
+            )
+
+    def bound_row(row: Mapping[str, Any]) -> Dict[str, Any]:
+        duplicates = _parse_json_cell(row.get("duplicate_cluster_ids"), [])
+        return {
+            "family_id": _clean(row.get("family_id")),
+            "cluster_id": _clean(row.get("cluster_id")),
+            "tier_screen": _clean(row.get("tier_screen")).lower(),
+            "include": _clean(row.get("include")).lower(),
+            "canonical_issue": _clean(row.get("canonical_issue")),
+            "severity": _clean(row.get("severity")).lower(),
+            "evidentiary_support": _clean(row.get("evidentiary_support")).lower(),
+            "duplicate_cluster_ids": sorted(map(str, duplicates or [])),
+            "exclusion_reason": _clean(row.get("exclusion_reason")),
+        }
+
+    source_binding = _clean(gold_validation.get("binding_hash"))
+    if not source_binding:
+        raise ValueError("Partial-gold evaluation requires a nonempty source binding hash.")
+    binding = stable_hash(
+        {
+            "projection_version": PARTIAL_GOLD_BINDING_VERSION,
+            "source_binding_hash": source_binding,
+            "completed_rows": [bound_row(row) for row in completed_rows],
+        }
+    )
+    progress = gold_adjudication_progress(rows)
+    coverage = {
+        "total_cluster_count": progress["total"],
+        "adjudicated_cluster_count": len(completed_rows),
+        "unadjudicated_cluster_count": progress["total"] - len(completed_rows),
+        "adjudicated_cluster_rate": round(len(completed_rows) / progress["total"], 4),
+        "tier_screened_count": progress["tier_done"],
+        "full_required_count": progress["full_total"],
+        "full_required_completed_count": progress["full_done"],
+        "eligible_scoring_cluster_count": len(scoring_rows),
+        "excluded_cluster_count": sum(
+            _clean(row.get("include")).lower() == "no" for row in completed_rows
+        ),
+        "tier_only_non_scoring_cluster_count": sum(
+            _clean(row.get("include")).lower() not in INCLUDE_VALUES
+            for row in completed_rows
+        ),
+    }
+    return {
+        "status": "ready",
+        "completed": True,
+        "gold_mode": "partial",
+        "evaluation_scope": "partial_gold_pilot",
+        "denominator_scope": "adjudicated_clusters_only",
+        "exhaustive_major_recall": False,
+        "binding_hash": binding,
+        "source_binding_hash": source_binding,
+        "rows": scoring_rows,
+        "cluster_count": len(scoring_rows),
+        "coverage": coverage,
+        "errors": [],
+        "pending_fields": [],
+    }
+
+
+def _file_revision(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+@contextmanager
+def _gold_editor_lock(path: Path) -> Iterator[None]:
+    """Serialize editor saves across local browser sessions on POSIX systems."""
+    try:
+        import fcntl
+    except ImportError as exc:  # pragma: no cover - the launcher targets macOS/POSIX
+        raise RuntimeError(
+            "Guarded adjudication saves require a POSIX file-lock implementation."
+        ) from exc
+    lock_path = path.with_name(f".{path.name}.lock")
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
+
+
+def load_gold_editor_state(
+    csv_path: str | Path,
+    *,
+    private_root: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Load a private gold packet with a revision token for guarded UI edits."""
+    private_path = _assert_private_input(csv_path, private_root=private_root)
+    for _ in range(3):
+        before = _file_revision(private_path)
+        rows = _read_csv(private_path, private_root=private_root)
+        after = _file_revision(private_path)
+        if before == after:
+            break
+    else:
+        raise RuntimeError("The adjudication file changed repeatedly while it was being read.")
+    validation = validate_gold_rows(rows)
+    return {
+        "csv_path": str(private_path),
+        "revision": after,
+        "rows": rows,
+        "validation": validation,
+        "progress": gold_adjudication_progress(rows),
+    }
+
+
+def save_gold_editor_rows(
+    csv_path: str | Path,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    expected_revision: str,
+    private_root: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Atomically save UI edits while preserving bound packet fields.
+
+    Incomplete human labels are valid drafts. Invalid rows, immutable-field
+    changes, and revisions from an older browser view are rejected before the
+    file is replaced.
+    """
+    private_path = _assert_private_input(csv_path, private_root=private_root)
+    with _gold_editor_lock(private_path):
+        current = load_gold_editor_state(private_path, private_root=private_root)
+        if not expected_revision or current["revision"] != expected_revision:
+            raise RuntimeError(
+                "The adjudication file changed since this page loaded. Reload before saving."
+            )
+
+        proposed = [dict(row) for row in rows]
+        current_rows = current["rows"]
+        if len(proposed) != len(current_rows):
+            raise ValueError("The adjudication row count cannot change in the editor.")
+        missing = [
+            f"row {index}: {column}"
+            for index, row in enumerate(proposed, start=1)
+            for column in GOLD_COLUMNS
+            if column not in row
+        ]
+        if missing:
+            raise ValueError(
+                "Adjudication rows are missing required columns: " + ", ".join(missing)
+            )
+
+        immutable_changes: List[str] = []
+        for current_row, proposed_row in zip(current_rows, proposed):
+            cluster_id = _clean(current_row.get("cluster_id")) or "<missing>"
+            for column in GOLD_IMMUTABLE_COLUMNS:
+                if str(proposed_row.get(column, "")) != str(current_row.get(column, "")):
+                    immutable_changes.append(f"{cluster_id}: {column}")
+        if immutable_changes:
+            raise ValueError(
+                "The editor cannot change bound packet fields: "
+                + ", ".join(immutable_changes)
+            )
+
+        expected_binding = current["validation"].get("binding_hash")
+        expected_ids = [row["cluster_id"] for row in current_rows]
+        validation = validate_gold_rows(
+            proposed,
+            expected_binding_hash=expected_binding,
+            expected_cluster_ids=expected_ids,
+        )
+        if validation["status"] in {"invalid", "stale"}:
+            details = validation["errors"] or [validation["status"]]
+            raise ValueError("Adjudication edits are invalid: " + "; ".join(details))
+
+        cleaned = [
+            {column: str(row.get(column, "")) for column in GOLD_COLUMNS}
+            for row in proposed
+        ]
+        _write_csv(private_path, GOLD_COLUMNS, cleaned)
+        return load_gold_editor_state(private_path, private_root=private_root)
+
+
 def _generated_id(issue: Mapping[str, Any]) -> str:
     existing = _clean(issue.get("generated_issue_id"))
     if existing:
@@ -924,6 +1305,8 @@ def _best_gold_match(issue: Mapping[str, Any], gold_rows: Sequence[Mapping[str, 
     best_shared: List[str] = []
     for row in gold_rows:
         if _clean(row.get("family_id")) != family:
+            continue
+        if _clean(row.get("include")).lower() != "yes":
             continue
         score, shared = _text_similarity(_issue_text(issue), _clean(row.get("representative_text")))
         cluster_id = _clean(row.get("cluster_id"))
@@ -1128,10 +1511,11 @@ def validate_generated_rows(
             if _clean(row.get(field)).lower() not in allowed:
                 pending.append(f"{issue_id}: {field}")
         match_status = _clean(row.get("human_match_status")).lower()
-        confirmed = _parse_json_cell(row.get("confirmed_human_cluster_ids"), [])
-        if not isinstance(confirmed, list):
+        confirmed, confirmed_valid = _parse_json_list_cell(
+            row.get("confirmed_human_cluster_ids")
+        )
+        if not confirmed_valid:
             errors.append(f"{issue_id}: confirmed_human_cluster_ids must be a JSON list")
-            confirmed = []
         if match_status == "matched" and not confirmed:
             pending.append(f"{issue_id}: confirmed_human_cluster_ids")
         if match_status == "unmatched" and confirmed:
@@ -1377,13 +1761,24 @@ def compute_privacy_safe_metrics(
     reviewer IDs, locators, evidence text, or filesystem paths.
     """
     if gold_validation.get("status") != "ready" or generated_validation.get("status") != "ready":
-        return {
+        pending_result = {
             "status": "pending_human_adjudication",
             "gold_status": gold_validation.get("status", "missing"),
             "generated_status": generated_validation.get("status", "missing"),
             "gold_pending_count": len(gold_validation.get("pending_fields", [])),
             "generated_pending_count": len(generated_validation.get("pending_fields", [])),
         }
+        if gold_validation.get("gold_mode") == "partial":
+            pending_result.update(
+                {
+                    "gold_mode": "partial",
+                    "evaluation_scope": "partial_gold_pilot",
+                    "denominator_scope": "adjudicated_clusters_only",
+                    "exhaustive_major_recall": False,
+                    "gold_coverage": dict(gold_validation.get("coverage", {})),
+                }
+            )
+        return pending_result
 
     metadata = family_metadata or {}
     costs = cost_by_family or {}
@@ -1466,7 +1861,7 @@ def compute_privacy_safe_metrics(
     all_supported = sum(row["supported_significant_issue_count"] for row in per_family)
     all_novel = sum(row["valid_novel_issue_count"] for row in per_family)
     all_duplicates = sum(row["duplicate_issue_count"] for row in per_family)
-    return {
+    result = {
         "status": "complete",
         "top_k": top_k,
         "primary_family_count": len(primary),
@@ -1492,6 +1887,41 @@ def compute_privacy_safe_metrics(
         "total_cost_usd": round(sum(float(costs.get(family, 0.0)) for family in families), 6),
         "families": per_family,
     }
+    if gold_validation.get("gold_mode") == "partial":
+        result["status"] = "partial_gold_pilot"
+        result["evaluation_scope"] = "partial_gold_pilot"
+        result["denominator_scope"] = "adjudicated_clusters_only"
+        result["exhaustive_major_recall"] = False
+        result["novelty_reference_scope"] = "partial_gold_plus_manual_judgment"
+        result["gold_coverage"] = dict(gold_validation.get("coverage", {}))
+        result[
+            "adjudicated_subset_primary_family_macro_major_cluster_recall_at_5"
+        ] = result.pop("primary_family_macro_major_cluster_recall_at_5")
+        result[
+            "adjudicated_subset_journal_family_macro_major_cluster_recall_at_5"
+        ] = result.pop("journal_family_macro_major_cluster_recall_at_5")
+        for family in result["families"]:
+            family["adjudicated_major_cluster_count"] = family.pop(
+                "major_cluster_count"
+            )
+            family["adjudicated_major_clusters_recalled_at_5"] = family.pop(
+                "major_clusters_recalled_at_5"
+            )
+            family["adjudicated_major_cluster_recall_at_5"] = family.pop(
+                "major_cluster_recall_at_5"
+            )
+        result["primary_families_with_adjudicated_major_denominator"] = sum(
+            row["benchmark_tier"] == "primary"
+            and row["adjudicated_major_cluster_count"] > 0
+            for row in result["families"]
+        )
+        result["journal_families_with_adjudicated_major_denominator"] = sum(
+            row["benchmark_tier"] == "primary"
+            and row["is_journal_case"]
+            and row["adjudicated_major_cluster_count"] > 0
+            for row in result["families"]
+        )
+    return result
 
 
 __all__ = [
@@ -1500,13 +1930,22 @@ __all__ = [
     "DEFAULT_SAMPLE_SEED",
     "GENERATED_COLUMNS",
     "GOLD_COLUMNS",
+    "GOLD_EDITABLE_COLUMNS",
+    "GOLD_IMMUTABLE_COLUMNS",
     "PACKET_VERSION",
+    "PARTIAL_GOLD_BINDING_VERSION",
     "cluster_normalized_issues",
     "compute_privacy_safe_metrics",
+    "eligible_duplicate_clusters",
     "generated_binding_hash",
+    "gold_adjudication_progress",
     "gold_binding_hash",
+    "gold_row_requirements",
     "load_generated_adjudication",
+    "load_gold_editor_state",
     "load_gold_adjudication",
+    "project_partial_gold_adjudication",
+    "save_gold_editor_rows",
     "select_full_adjudication_clusters",
     "select_generated_top_k",
     "stable_hash",

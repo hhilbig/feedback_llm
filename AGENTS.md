@@ -15,6 +15,9 @@ pip install -r requirements.txt
 # Run web app
 streamlit run streamlit_app.py
 
+# Run private, offline adjudication app
+streamlit run adjudication_app.py --server.address 127.0.0.1 --browser.gatherUsageStats false
+
 # CLI alternatives
 python3 -m feedback_pipeline --clipboard
 python3 -m feedback_pipeline --pdf paper.pdf
@@ -22,7 +25,7 @@ python3 -m feedback_pipeline --file paper.txt
 
 # Offline tests
 python3 -m unittest discover -s tests
-python3 -m py_compile feedback_pipeline.py streamlit_app.py tests/*.py
+python3 -m py_compile feedback_pipeline.py streamlit_app.py adjudication_app.py tests/*.py
 ```
 
 ## Architecture
