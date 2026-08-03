@@ -28,11 +28,19 @@ to create a defensible adjudication packet.
 The benchmark now accepts one to five real final issues per case. Missing slots
 count as misses for supported-significant precision@5 and valid-novelty yield@5;
 duplicate rate remains conditional on returned issues. The runner writes a private
-full-text checkpoint after each completed case and before the final audit. A fresh
-five-manuscript rerun is authorized with a $10 ceiling. The German AJPS source
-still includes only verbatim reviewer passages from the response memo. Author
-responses and the merged resubmission remain hash-bound deferred sources and are
-not evaluation targets.
+full-text checkpoint after each completed case and before the final audit.
+
+The rerun on commit `f2cfe1d` completed all five cases and cost $9.9614, below
+the approved $10 ceiling. It returned five issues per case, creating a 25-row
+canonical generated-issue packet. Every split records zero review-memory records
+and zero review-memory issues. The canonical packet and content-addressed checkpoint
+have matching bindings, all private artifacts have the required permissions, and
+the portable result contains no private paths or issue text. The run is now
+`pending_human_adjudication`.
+
+The German AJPS source still includes only verbatim reviewer passages from the
+response memo. Author responses and the merged resubmission remain hash-bound
+deferred sources and are not evaluation targets.
 
 ## Implemented
 
@@ -80,20 +88,14 @@ not evaluation targets.
 
 ## Next Validation Gate
 
-1. Run the full offline suite and commit the output-policy and checkpoint change
-   so the rerun has a clean, frozen code state.
-2. Re-run the zero-call partial-gold estimate. Proceed only if the current corpus
-   and gold bindings remain valid and the estimate is below the approved $10
-   ceiling.
-3. Run the authorized five-manuscript cold baseline and verify that all five cases
-   finish, actual cost stays below $10, and every split records zero review-memory
-   inputs.
-4. Verify the canonical generated packet, content-addressed checkpoint, private
-   permissions, portable-output redaction, and binding consistency.
-5. Label every returned generated issue, then finalize explicitly partial,
+1. Label all 25 rows in the generated-issue packet for correctness, significance,
+   evidence sufficiency, human-cluster match, duplication, and valid novelty.
+2. Finalize explicitly partial,
    non-exhaustive major-recall results plus sampled-minor, precision, novelty,
    duplicate, and cost metrics.
-6. Screen the remaining 93 rows later if an exhaustive benchmark is still worth
+3. Use the adjudicated baseline to decide whether prompt, routing, or threshold
+   changes are justified. Do not tune the pipeline against unadjudicated output.
+4. Screen the remaining 93 rows later if an exhaustive benchmark is still worth
    the additional labeling time.
 
 Do not change reviewer prompts, models, routing, reasoning effort, thresholds,
