@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 import tempfile
@@ -11,6 +12,7 @@ from unittest.mock import patch
 from streamlit.testing.v1 import AppTest
 
 import adjudication_app as app
+import feedback_pipeline as fp
 import review_adjudication as ra
 
 
@@ -316,6 +318,94 @@ class GoldEditorHelperTests(unittest.TestCase):
             any("must be a JSON list" in error for error in generated["errors"])
         )
 
+    def test_generated_edit_clears_conditional_fields(self):
+        row = {column: "" for column in ra.GENERATED_COLUMNS}
+        row.update(
+            {
+                "confirmed_human_cluster_ids": json.dumps(["cluster-a"]),
+                "duplicate_of_generated_id": "generated-2",
+                "valid_novelty": "yes",
+            }
+        )
+        updated = app._build_generated_row_edit(
+            row,
+            correctness="correct",
+            significance="significant",
+            evidence_sufficiency="sufficient",
+            human_match_status="unmatched",
+            confirmed_human_cluster_ids=["cluster-a"],
+            duplicate_status="duplicate",
+            duplicate_of_generated_id="generated-2",
+            valid_novelty="yes",
+            adjudicator_notes="  checked  ",
+        )
+        self.assertEqual(updated["confirmed_human_cluster_ids"], "[]")
+        self.assertEqual(updated["duplicate_of_generated_id"], "generated-2")
+        self.assertEqual(updated["valid_novelty"], "no")
+        self.assertEqual(updated["adjudicator_notes"], "checked")
+
+    def test_generated_candidates_are_scoped_to_family_and_case(self):
+        gold_rows = [
+            {
+                "cluster_id": "a-included",
+                "family_id": "family-a",
+                "include": "yes",
+            },
+            {
+                "cluster_id": "a-excluded",
+                "family_id": "family-a",
+                "include": "no",
+            },
+            {
+                "cluster_id": "b-included",
+                "family_id": "family-b",
+                "include": "yes",
+            },
+        ]
+        self.assertEqual(
+            [
+                row["cluster_id"]
+                for row in app._generated_match_candidates(gold_rows, "family-a")
+            ],
+            ["a-included"],
+        )
+
+        generated_rows = [
+            {
+                "generated_issue_id": "a1",
+                "family_id": "family-a",
+                "case_id": "case-1",
+                "rank": "1",
+            },
+            {
+                "generated_issue_id": "a2",
+                "family_id": "family-a",
+                "case_id": "case-1",
+                "rank": "2",
+            },
+            {
+                "generated_issue_id": "a3",
+                "family_id": "family-a",
+                "case_id": "case-2",
+                "rank": "1",
+            },
+            {
+                "generated_issue_id": "b1",
+                "family_id": "family-b",
+                "case_id": "case-1",
+                "rank": "1",
+            },
+        ]
+        self.assertEqual(
+            [
+                row["generated_issue_id"]
+                for row in app._generated_duplicate_candidates(
+                    generated_rows, "a1"
+                )
+            ],
+            ["a2"],
+        )
+
 
 class AdjudicationAppSmokeTests(unittest.TestCase):
     def test_app_opens_and_saves_a_complete_full_row(self):
@@ -343,8 +433,16 @@ class AdjudicationAppSmokeTests(unittest.TestCase):
                 self.assertEqual(len(test_app.exception), 0)
                 self.assertEqual(test_app.title[0].value, "Adjudicate historical feedback")
 
-                test_app.radio[0].set_value("major")
-                test_app.radio[1].set_value("yes")
+                next(
+                    field
+                    for field in test_app.radio
+                    if field.label == "How consequential is this concern?"
+                ).set_value("major")
+                next(
+                    field
+                    for field in test_app.radio
+                    if field.label == "Keep this as a valid human concern?"
+                ).set_value("yes")
                 next(
                     field
                     for field in test_app.text_area
@@ -365,6 +463,174 @@ class AdjudicationAppSmokeTests(unittest.TestCase):
             saved = ra.load_gold_editor_state(packet["csv_path"], private_root=tmp)
             self.assertEqual(saved["validation"]["status"], "ready")
             self.assertEqual(saved["rows"][0]["tier_screen"], "major")
+
+    def test_generated_workflow_opens_and_saves_one_complete_label(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            human_packet = ra.write_gold_adjudication_packet(
+                [
+                    issue(
+                        "family-a",
+                        "major",
+                        "The identifying assumption is not defended.",
+                        "major_revision_issue",
+                    )
+                ],
+                root,
+                private_root=root,
+            )
+            gold_rows = deepcopy(human_packet["rows"])
+            complete_row(gold_rows[0])
+            gold = ra.validate_gold_rows(
+                gold_rows,
+                expected_binding_hash=human_packet["binding_hash"],
+            )
+            self.assertEqual(gold["status"], "ready")
+            ra._write_csv(
+                root / "gold_adjudication.csv",
+                ra.GOLD_COLUMNS,
+                gold_rows,
+            )
+
+            corpus = {"binding_hash": "test-corpus-binding"}
+            run_metadata = {
+                "git": {"commit": "test-commit"},
+                "routing": {"generation": "test-model"},
+                "num_agents": 8,
+                "reviewer_roles": {"editor": 1},
+                "top_k": 5,
+                "top_k_policy": "up_to_k_missing_slots_count_as_misses",
+                "memory_mode": "none",
+                "gold_mode": "complete",
+                "gold_binding_hash": gold["binding_hash"],
+                "benchmark_binding": {"cases": ["case-a"]},
+            }
+            run_context = fp._review_eval_generated_binding_context(
+                corpus,
+                run_metadata,
+            )
+            generated_packet = ra.write_generated_adjudication_packet(
+                [
+                    {
+                        "family_id": "family-a",
+                        "case_id": "case-a",
+                        "id": "pipeline-1",
+                        "rank": 1,
+                        "text": "The identifying assumption needs a direct defense.",
+                        "evidence_ids": ["P001"],
+                    }
+                ],
+                gold,
+                root,
+                run_binding_context=run_context,
+                private_root=root,
+            )
+            manifest = root / "review_manifest.json"
+            manifest.write_text("{}", encoding="utf-8")
+            manifest.chmod(0o600)
+            audit_path = root / "baseline_run.local_audit.json"
+            audit_path.write_text(
+                json.dumps(
+                    {
+                        "run_metadata": run_metadata,
+                        "generated_adjudication": {
+                            "binding_hash": generated_packet["binding_hash"]
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            audit_path.chmod(0o600)
+
+            environment = {
+                "FEEDBACK_LLM_PRIVATE_ROOT": str(root),
+                "FEEDBACK_LLM_GENERATED_ADJUDICATION_PATH": generated_packet[
+                    "csv_path"
+                ],
+            }
+            with (
+                patch.dict(os.environ, environment),
+                patch.object(fp, "load_review_corpus", return_value=corpus),
+                patch.object(fp, "_manifest_baseline_audit_errors", return_value=[]),
+                patch.object(
+                    fp,
+                    "_load_current_gold_adjudication",
+                    return_value=gold,
+                ),
+                patch.object(
+                    fp,
+                    "_gold_adjudication_for_evaluation",
+                    return_value=gold,
+                ),
+            ):
+                test_app = AppTest.from_file(
+                    str(Path(app.__file__)), default_timeout=10
+                ).run()
+                self.assertEqual(len(test_app.exception), 0)
+                self.assertEqual(test_app.title[0].value, "Label generated feedback")
+                self.assertEqual(
+                    next(
+                        field for field in test_app.radio if field.label == "Task"
+                    ).value,
+                    "Generated issues",
+                )
+
+                next(
+                    field
+                    for field in test_app.radio
+                    if field.label == "Is the critique correct?"
+                ).set_value("correct")
+                next(
+                    field
+                    for field in test_app.radio
+                    if field.label == "How significant is it?"
+                ).set_value("significant")
+                next(
+                    field
+                    for field in test_app.radio
+                    if field.label == "Is the cited evidence sufficient?"
+                ).set_value("sufficient")
+                next(
+                    field
+                    for field in test_app.radio
+                    if field.label
+                    == "Does it match an adjudicated human concern?"
+                ).set_value("unmatched")
+                next(
+                    field
+                    for field in test_app.radio
+                    if field.label
+                    == "Is this a duplicate of another final critique for this manuscript?"
+                ).set_value("unique")
+                test_app.run()
+                self.assertEqual(len(test_app.exception), 0)
+                novelty = next(
+                    field
+                    for field in test_app.radio
+                    if field.label
+                    == "Is this a valid novel contribution from the pipeline?"
+                )
+                self.assertFalse(novelty.disabled)
+                novelty.set_value("no")
+                next(
+                    button for button in test_app.button if button.label == "Save"
+                ).click()
+                test_app.run()
+                self.assertEqual(len(test_app.exception), 0)
+
+            saved = ra.load_generated_editor_state(
+                generated_packet["csv_path"],
+                expected_binding_hash=generated_packet["binding_hash"],
+                expected_gold_binding_hash=gold["binding_hash"],
+                gold_cluster_families={
+                    gold_rows[0]["cluster_id"]: "family-a"
+                },
+                run_binding_context=run_context,
+                private_root=root,
+            )
+            self.assertEqual(saved["validation"]["status"], "ready")
+            self.assertEqual(saved["progress"]["complete"], 1)
+            self.assertEqual(saved["rows"][0]["correctness"], "correct")
 
 
 if __name__ == "__main__":

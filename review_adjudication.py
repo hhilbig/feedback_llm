@@ -128,6 +128,21 @@ GENERATED_COLUMNS = [
     "adjudicator_notes",
 ]
 
+GENERATED_EDITABLE_COLUMNS = (
+    "correctness",
+    "significance",
+    "evidence_sufficiency",
+    "human_match_status",
+    "confirmed_human_cluster_ids",
+    "duplicate_status",
+    "duplicate_of_generated_id",
+    "valid_novelty",
+    "adjudicator_notes",
+)
+GENERATED_IMMUTABLE_COLUMNS = tuple(
+    column for column in GENERATED_COLUMNS if column not in GENERATED_EDITABLE_COLUMNS
+)
+
 PARTIAL_GOLD_BINDING_VERSION = "feedback-llm-partial-gold-v1"
 
 
@@ -1443,6 +1458,143 @@ def write_generated_adjudication_packet(
     }
 
 
+def generated_row_requirements(
+    row: Mapping[str, Any],
+    *,
+    generated_rows: Sequence[Mapping[str, Any]] | None = None,
+    gold_cluster_families: Mapping[str, str] | None = None,
+    top_k: int | None = None,
+) -> Dict[str, Any]:
+    """Return conditional label requirements for one generated issue row."""
+    issue_id = _clean(row.get("generated_issue_id")) or "<missing>"
+    family_id = _clean(row.get("family_id"))
+    case_id = _clean(row.get("case_id"))
+    known_generated = {
+        _clean(item.get("generated_issue_id")): item
+        for item in (generated_rows or [row])
+        if _clean(item.get("generated_issue_id"))
+    }
+    known_gold = {
+        str(cluster_id): _clean(cluster_family)
+        for cluster_id, cluster_family in (gold_cluster_families or {}).items()
+    }
+    pending: List[str] = []
+    errors: List[str] = []
+
+    rank_text = _clean(row.get("rank"))
+    if not rank_text.isdigit() or int(rank_text) <= 0:
+        errors.append("rank must be a positive integer")
+    elif top_k is not None and int(rank_text) > top_k:
+        errors.append(f"rank must not exceed top_k={top_k}")
+
+    checks = {
+        "correctness": CORRECTNESS_VALUES,
+        "significance": SIGNIFICANCE_VALUES,
+        "evidence_sufficiency": EVIDENCE_VALUES,
+        "human_match_status": MATCH_STATUS_VALUES,
+        "duplicate_status": DUPLICATE_STATUS_VALUES,
+        "valid_novelty": YES_NO_VALUES,
+    }
+    for field, allowed in checks.items():
+        value = _clean(row.get(field)).lower()
+        if not value:
+            pending.append(field)
+        elif value not in allowed:
+            errors.append(f"{field} must be one of: {', '.join(sorted(allowed))}")
+
+    match_status = _clean(row.get("human_match_status")).lower()
+    confirmed, confirmed_valid = _parse_json_list_cell(
+        row.get("confirmed_human_cluster_ids")
+    )
+    if not confirmed_valid:
+        errors.append("confirmed_human_cluster_ids must be a JSON list")
+    else:
+        confirmed_ids = [str(cluster_id) for cluster_id in confirmed]
+        if match_status == "matched" and not confirmed_ids:
+            pending.append("confirmed_human_cluster_ids")
+        if match_status == "unmatched" and confirmed_ids:
+            errors.append("unmatched row cannot confirm human clusters")
+        if gold_cluster_families is not None:
+            for cluster_id in confirmed_ids:
+                if cluster_id not in known_gold:
+                    errors.append(f"confirms an unknown human cluster: {cluster_id}")
+                elif known_gold[cluster_id] != family_id:
+                    errors.append("confirmed human cluster must be in the same family")
+
+    duplicate_status = _clean(row.get("duplicate_status")).lower()
+    duplicate_of = _clean(row.get("duplicate_of_generated_id"))
+    if duplicate_status == "duplicate":
+        if not duplicate_of:
+            pending.append("duplicate_of_generated_id")
+        elif duplicate_of not in known_generated or duplicate_of == issue_id:
+            errors.append("duplicate target must be another generated issue in the packet")
+        else:
+            target = known_generated[duplicate_of]
+            if (
+                _clean(target.get("family_id")) != family_id
+                or _clean(target.get("case_id")) != case_id
+            ):
+                errors.append("duplicate target must be in the same family and case")
+    if duplicate_status == "unique" and duplicate_of:
+        errors.append("unique row cannot have duplicate_of_generated_id")
+
+    novelty = _clean(row.get("valid_novelty")).lower()
+    if novelty == "yes":
+        if match_status != "unmatched":
+            errors.append("valid novelty must be unmatched")
+        if _clean(row.get("correctness")).lower() != "correct":
+            errors.append("valid novelty must be correct")
+        if _clean(row.get("evidence_sufficiency")).lower() != "sufficient":
+            errors.append("valid novelty must have sufficient evidence")
+        if duplicate_status != "unique":
+            errors.append("valid novelty must be unique")
+
+    return {
+        "generated_issue_id": issue_id,
+        "pending_fields": pending,
+        "errors": errors,
+        "complete": not pending and not errors,
+    }
+
+
+def generated_adjudication_progress(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    gold_cluster_families: Mapping[str, str] | None = None,
+    top_k: int | None = None,
+) -> Dict[str, Any]:
+    """Summarize generated-issue label progress for the local editor."""
+    states = [
+        generated_row_requirements(
+            row,
+            generated_rows=rows,
+            gold_cluster_families=gold_cluster_families,
+            top_k=top_k,
+        )
+        for row in rows
+    ]
+    families: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"total": 0, "complete": 0, "remaining": 0}
+    )
+    cases: Dict[str, Dict[str, int]] = defaultdict(
+        lambda: {"total": 0, "complete": 0, "remaining": 0}
+    )
+    for row, state in zip(rows, states):
+        family_id = _clean(row.get("family_id"))
+        case_key = f"{family_id}/{_clean(row.get('case_id'))}"
+        for bucket in (families[family_id], cases[case_key]):
+            bucket["total"] += 1
+            bucket["complete"] += int(state["complete"])
+            bucket["remaining"] += int(not state["complete"])
+    return {
+        "total": len(rows),
+        "complete": sum(int(state["complete"]) for state in states),
+        "remaining": sum(int(not state["complete"]) for state in states),
+        "families": {key: dict(value) for key, value in sorted(families.items())},
+        "cases": {key: dict(value) for key, value in sorted(cases.items())},
+    }
+
+
 def validate_generated_rows(
     rows: Sequence[Mapping[str, Any]],
     *,
@@ -1450,6 +1602,7 @@ def validate_generated_rows(
     expected_gold_binding_hash: str | None = None,
     expected_generated_issue_ids: Iterable[str] | None = None,
     valid_gold_cluster_ids: Iterable[str] | None = None,
+    gold_cluster_families: Mapping[str, str] | None = None,
     top_k: int | None = None,
 ) -> Dict[str, Any]:
     """Validate all manual labels in a generated top-K packet."""
@@ -1487,13 +1640,16 @@ def validate_generated_rows(
         errors.append("packet generated-issue set does not match current baseline output")
     rank_keys: set[Tuple[str, str, int]] = set()
     ranks_by_case: Dict[Tuple[str, str], set[int]] = defaultdict(set)
-    gold_ids = set(valid_gold_cluster_ids or [])
+    known_gold_families = {
+        str(cluster_id): _clean(family_id)
+        for cluster_id, family_id in (gold_cluster_families or {}).items()
+    }
+    gold_ids_known = valid_gold_cluster_ids is not None
+    gold_ids = set(str(value) for value in (valid_gold_cluster_ids or []))
     for row in rows:
         issue_id = _clean(row.get("generated_issue_id")) or "<missing>"
         rank_text = _clean(row.get("rank"))
-        if not rank_text.isdigit() or int(rank_text) <= 0:
-            errors.append(f"{issue_id}: rank must be a positive integer")
-        else:
+        if rank_text.isdigit() and int(rank_text) > 0:
             rank_value = int(rank_text)
             rank_key = (
                 _clean(row.get("family_id")),
@@ -1504,48 +1660,28 @@ def validate_generated_rows(
                 errors.append(f"{issue_id}: rank must be unique within family/case")
             rank_keys.add(rank_key)
             ranks_by_case[rank_key[:2]].add(rank_value)
-            if top_k is not None and rank_value > top_k:
-                errors.append(f"{issue_id}: rank must not exceed top_k={top_k}")
-        checks = {
-            "correctness": CORRECTNESS_VALUES,
-            "significance": SIGNIFICANCE_VALUES,
-            "evidence_sufficiency": EVIDENCE_VALUES,
-            "human_match_status": MATCH_STATUS_VALUES,
-            "duplicate_status": DUPLICATE_STATUS_VALUES,
-            "valid_novelty": YES_NO_VALUES,
-        }
-        for field, allowed in checks.items():
-            if _clean(row.get(field)).lower() not in allowed:
-                pending.append(f"{issue_id}: {field}")
-        match_status = _clean(row.get("human_match_status")).lower()
+        state = generated_row_requirements(
+            row,
+            generated_rows=rows,
+            gold_cluster_families=(
+                known_gold_families
+                if gold_cluster_families is not None
+                else None
+            ),
+            top_k=top_k,
+        )
+        pending.extend(f"{issue_id}: {field}" for field in state["pending_fields"])
+        errors.extend(f"{issue_id}: {error}" for error in state["errors"])
+
         confirmed, confirmed_valid = _parse_json_list_cell(
             row.get("confirmed_human_cluster_ids")
         )
-        if not confirmed_valid:
-            errors.append(f"{issue_id}: confirmed_human_cluster_ids must be a JSON list")
-        if match_status == "matched" and not confirmed:
-            pending.append(f"{issue_id}: confirmed_human_cluster_ids")
-        if match_status == "unmatched" and confirmed:
-            errors.append(f"{issue_id}: unmatched row cannot confirm human clusters")
-        if gold_ids and any(str(cluster_id) not in gold_ids for cluster_id in confirmed):
+        if (
+            confirmed_valid
+            and gold_ids_known
+            and any(str(cluster_id) not in gold_ids for cluster_id in confirmed)
+        ):
             errors.append(f"{issue_id}: confirms an unknown human cluster")
-        duplicate_status = _clean(row.get("duplicate_status")).lower()
-        duplicate_of = _clean(row.get("duplicate_of_generated_id"))
-        if duplicate_status == "duplicate":
-            if not duplicate_of:
-                pending.append(f"{issue_id}: duplicate_of_generated_id")
-            elif duplicate_of not in generated_ids or duplicate_of == issue_id:
-                errors.append(f"{issue_id}: duplicate target must be another generated issue in the packet")
-        if duplicate_status == "unique" and duplicate_of:
-            errors.append(f"{issue_id}: unique row cannot have duplicate_of_generated_id")
-        novelty = _clean(row.get("valid_novelty")).lower()
-        if novelty == "yes":
-            if match_status != "unmatched":
-                errors.append(f"{issue_id}: valid novelty must be unmatched")
-            if _clean(row.get("correctness")).lower() != "correct":
-                errors.append(f"{issue_id}: valid novelty must be correct")
-            if _clean(row.get("evidence_sufficiency")).lower() != "sufficient":
-                errors.append(f"{issue_id}: valid novelty must have sufficient evidence")
 
     if top_k is not None:
         for case_key, ranks in sorted(ranks_by_case.items()):
@@ -1581,6 +1717,7 @@ def load_generated_adjudication(
     expected_binding_hash: str | None = None,
     expected_gold_binding_hash: str | None = None,
     valid_gold_cluster_ids: Iterable[str] | None = None,
+    gold_cluster_families: Mapping[str, str] | None = None,
     generated_issues: Sequence[Mapping[str, Any]] | None = None,
     run_binding_context: Mapping[str, Any] | None = None,
     top_k: int = 5,
@@ -1645,6 +1782,7 @@ def load_generated_adjudication(
         expected_gold_binding_hash=expected_gold_binding_hash,
         expected_generated_issue_ids=expected_ids,
         valid_gold_cluster_ids=valid_gold_cluster_ids,
+        gold_cluster_families=gold_cluster_families,
         top_k=top_k,
     )
     if selected is not None:
@@ -1676,6 +1814,166 @@ def load_generated_adjudication(
             result["completed"] = False
     result["csv_path"] = str(Path(csv_path).expanduser())
     return result
+
+
+def load_generated_editor_state(
+    csv_path: str | Path,
+    *,
+    expected_binding_hash: str | None = None,
+    expected_gold_binding_hash: str | None = None,
+    gold_cluster_families: Mapping[str, str] | None = None,
+    run_binding_context: Mapping[str, Any] | None = None,
+    top_k: int = 5,
+    private_root: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Load a generated packet with a revision token for guarded UI edits."""
+    private_path = _assert_private_input(csv_path, private_root=private_root)
+    for _ in range(3):
+        before = _file_revision(private_path)
+        validation = load_generated_adjudication(
+            private_path,
+            expected_binding_hash=expected_binding_hash,
+            expected_gold_binding_hash=expected_gold_binding_hash,
+            gold_cluster_families=gold_cluster_families,
+            run_binding_context=run_binding_context,
+            top_k=top_k,
+            private_root=private_root,
+        )
+        after = _file_revision(private_path)
+        if before == after:
+            break
+    else:
+        raise RuntimeError(
+            "The generated adjudication file changed repeatedly while it was being read."
+        )
+    rows = list(validation.get("rows", []))
+    return {
+        "csv_path": str(private_path),
+        "revision": after,
+        "rows": rows,
+        "validation": validation,
+        "progress": generated_adjudication_progress(
+            rows,
+            gold_cluster_families=gold_cluster_families,
+            top_k=top_k,
+        ),
+    }
+
+
+def save_generated_editor_rows(
+    csv_path: str | Path,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    expected_revision: str,
+    expected_binding_hash: str | None = None,
+    expected_gold_binding_hash: str | None = None,
+    gold_cluster_families: Mapping[str, str] | None = None,
+    run_binding_context: Mapping[str, Any] | None = None,
+    top_k: int = 5,
+    private_root: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Atomically save generated-label drafts without changing bound output fields."""
+    private_path = _assert_private_input(csv_path, private_root=private_root)
+    with _gold_editor_lock(private_path):
+        current = load_generated_editor_state(
+            private_path,
+            expected_binding_hash=expected_binding_hash,
+            expected_gold_binding_hash=expected_gold_binding_hash,
+            gold_cluster_families=gold_cluster_families,
+            run_binding_context=run_binding_context,
+            top_k=top_k,
+            private_root=private_root,
+        )
+        if not expected_revision or current["revision"] != expected_revision:
+            raise RuntimeError(
+                "The generated adjudication file changed since this page loaded. "
+                "Reload before saving."
+            )
+        if current["validation"].get("status") == "stale":
+            details = current["validation"].get("errors") or [
+                current["validation"].get("status", "invalid")
+            ]
+            raise ValueError(
+                "The current generated adjudication packet is not editable: "
+                + "; ".join(details)
+            )
+
+        proposed = [dict(row) for row in rows]
+        current_rows = current["rows"]
+        if len(proposed) != len(current_rows):
+            raise ValueError(
+                "The generated adjudication row count cannot change in the editor."
+            )
+        missing = [
+            f"row {index}: {column}"
+            for index, row in enumerate(proposed, start=1)
+            for column in GENERATED_COLUMNS
+            if column not in row
+        ]
+        if missing:
+            raise ValueError(
+                "Generated adjudication rows are missing required columns: "
+                + ", ".join(missing)
+            )
+
+        current_order = [
+            _clean(row.get("generated_issue_id")) for row in current_rows
+        ]
+        proposed_order = [_clean(row.get("generated_issue_id")) for row in proposed]
+        if proposed_order != current_order:
+            raise ValueError(
+                "The generated adjudication row order cannot change in the editor."
+            )
+
+        immutable_changes: List[str] = []
+        for current_row, proposed_row in zip(current_rows, proposed):
+            issue_id = _clean(current_row.get("generated_issue_id")) or "<missing>"
+            for column in GENERATED_IMMUTABLE_COLUMNS:
+                if str(proposed_row.get(column, "")) != str(
+                    current_row.get(column, "")
+                ):
+                    immutable_changes.append(f"{issue_id}: {column}")
+        if immutable_changes:
+            raise ValueError(
+                "The editor cannot change bound generated packet fields: "
+                + ", ".join(immutable_changes)
+            )
+
+        current_validation = current["validation"]
+        validation = validate_generated_rows(
+            proposed,
+            expected_binding_hash=(
+                expected_binding_hash
+                or _clean(current_validation.get("binding_hash"))
+            ),
+            expected_gold_binding_hash=(
+                expected_gold_binding_hash
+                or _clean(current_validation.get("gold_binding_hash"))
+            ),
+            expected_generated_issue_ids=current_order,
+            gold_cluster_families=gold_cluster_families,
+            top_k=top_k,
+        )
+        if validation["status"] in {"invalid", "stale"}:
+            details = validation["errors"] or [validation["status"]]
+            raise ValueError(
+                "Generated adjudication edits are invalid: " + "; ".join(details)
+            )
+
+        cleaned = [
+            {column: str(row.get(column, "")) for column in GENERATED_COLUMNS}
+            for row in proposed
+        ]
+        _write_csv(private_path, GENERATED_COLUMNS, cleaned)
+        return load_generated_editor_state(
+            private_path,
+            expected_binding_hash=expected_binding_hash,
+            expected_gold_binding_hash=expected_gold_binding_hash,
+            gold_cluster_families=gold_cluster_families,
+            run_binding_context=run_binding_context,
+            top_k=top_k,
+            private_root=private_root,
+        )
 
 
 def _safe_ratio(numerator: int, denominator: int) -> float | None:
@@ -1988,6 +2286,8 @@ __all__ = [
     "DEFAULT_PRIVATE_ROOT",
     "DEFAULT_SAMPLE_SEED",
     "GENERATED_COLUMNS",
+    "GENERATED_EDITABLE_COLUMNS",
+    "GENERATED_IMMUTABLE_COLUMNS",
     "GOLD_COLUMNS",
     "GOLD_EDITABLE_COLUMNS",
     "GOLD_IMMUTABLE_COLUMNS",
@@ -1997,14 +2297,18 @@ __all__ = [
     "compute_privacy_safe_metrics",
     "eligible_duplicate_clusters",
     "generated_binding_hash",
+    "generated_adjudication_progress",
+    "generated_row_requirements",
     "gold_adjudication_progress",
     "gold_binding_hash",
     "gold_row_requirements",
     "load_generated_adjudication",
+    "load_generated_editor_state",
     "load_gold_editor_state",
     "load_gold_adjudication",
     "project_partial_gold_adjudication",
     "save_gold_editor_rows",
+    "save_generated_editor_rows",
     "select_full_adjudication_clusters",
     "select_generated_top_k",
     "stable_hash",

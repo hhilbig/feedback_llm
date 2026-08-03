@@ -75,6 +75,10 @@ deferred sources and are not evaluation targets.
 10. An up-to-five output policy with fixed five-slot denominators for supported
     precision and novelty yield, unchanged human-cluster recall denominators,
     and returned-issue denominators for duplicate rates.
+11. A local generated-issue labeling screen with binding verification, guarded
+    draft saves, manuscript-rank navigation, same-family human matches, and
+    same-case duplicate choices. The existing screen remains available for gold
+    feedback adjudication.
 
 ## Source Freeze
 
@@ -90,6 +94,8 @@ deferred sources and are not evaluation targets.
 
 1. Label all 25 rows in the generated-issue packet for correctness, significance,
    evidence sufficiency, human-cluster match, duplication, and valid novelty.
+   The local adjudication app now opens this queue by default and supports
+   **Save and next**.
 2. Finalize explicitly partial,
    non-exhaustive major-recall results plus sampled-minor, precision, novelty,
    duplicate, and cost metrics.

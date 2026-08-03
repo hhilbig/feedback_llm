@@ -241,6 +241,14 @@ matching supplies suggestions only. An unmatched generated concern is not counte
 as false until a person labels it. Each successful case must contain one to five
 contiguously ranked issues; no synthetic fifth row is added.
 
+The local adjudication app edits this packet one generated issue at a time. It
+shows the critique, evidence IDs, rank within the manuscript, same-family gold
+choices, and same-case duplicate choices. Saving is revision-guarded and atomic.
+The editor may change only the nine manual label and note fields; it rejects
+changes to issue text, evidence, rank, identifiers, bindings, row count, or row
+order. It also rebuilds the paid-run binding from the current private manifest,
+gold projection, and local audit before enabling a save.
+
 The benchmark treats each case as five available output slots. Missing slots count
 as misses for supported-significant precision@5 and valid-novelty yield@5. Human
 cluster recall keeps its human-target denominator, while duplicate rate uses only

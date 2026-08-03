@@ -200,7 +200,7 @@ contains only a pseudonymous example manifest. Saved evaluation JSON is a
 path-free aggregate projection; human feedback and generated issue text remain
 in the ignored local adjudication artifacts.
 
-To label the gold packet without editing CSV cells, double-click
+To label either private packet without editing CSV cells, double-click
 `run_adjudication_app.command`, or run:
 
 ```bash
@@ -209,10 +209,19 @@ streamlit run adjudication_app.py \
   --browser.gatherUsageStats false
 ```
 
-The local app opens the current private packet, shows one cluster at a time,
-and saves only the eight adjudication fields. Start with the **Full labels**
-queue, then use **Tier screen** for the remaining quick decisions. The app makes
-no API calls and refuses files outside `~/.feedback_llm/`.
+When a canonical `generated_adjudication.csv` exists, the app opens the generated
+issue workflow by default. It shows the full critique, cited evidence IDs, the
+five ranked critiques for that manuscript, and any same-family lexical match
+suggestion. For each issue, label correctness, significance, evidence
+sufficiency, human-cluster match, duplication, and valid novelty. **Save and
+next** moves to the next unfinished issue.
+
+Use the **Task** switch for the historical-feedback workflow. That screen shows
+one gold cluster at a time; start with **Full labels**, then use **Tier screen**
+for the remaining quick decisions. Both workflows write only their designated
+label fields to the private CSV. The app rechecks the source, gold, and baseline
+bindings before each save, makes no API calls, and refuses files outside
+`~/.feedback_llm/`.
 
 Gold validation has two passes. Every deduplicated cluster receives a quick
 major/minor/exclude screen. Full fields are required for every major cluster and

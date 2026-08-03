@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Mapping, Tuple
 
 # --- Smart API Key Loading ---
 from dotenv import load_dotenv
@@ -3631,18 +3631,11 @@ def finalize_review_evaluation(
             "Gold adjudication changed after the baseline run; regenerate the "
             "generated-adjudication packet."
         )
-    run_context = {
-        "corpus_binding_hash": _corpus_binding_hash(corpus),
-        "git_commit": run_metadata.get("git", {}).get("commit", "unknown"),
-        "routing": run_metadata.get("routing", {}),
-        "num_agents": run_metadata.get("num_agents", 0),
-        "reviewer_roles": run_metadata.get("reviewer_roles", {}),
-        "top_k": run_metadata.get("top_k", 5),
-        "top_k_policy": run_metadata.get("top_k_policy", ""),
-        "memory_mode": run_metadata.get("memory_mode", "none"),
-        "gold_mode": gold_mode,
-        "benchmark_binding": run_metadata.get("benchmark_binding", {}),
-    }
+    run_context = _review_eval_generated_binding_context(
+        corpus,
+        run_metadata,
+        gold_mode=gold_mode,
+    )
     from review_adjudication import (
         compute_privacy_safe_metrics,
         load_generated_adjudication,
@@ -3654,7 +3647,14 @@ def finalize_review_evaluation(
             "binding_hash"
         ),
         expected_gold_binding_hash=gold.get("binding_hash"),
-        valid_gold_cluster_ids=[row.get("cluster_id", "") for row in gold.get("rows", [])],
+        valid_gold_cluster_ids=[
+            row.get("cluster_id", "") for row in gold.get("rows", [])
+        ],
+        gold_cluster_families={
+            str(row.get("cluster_id", "")): str(row.get("family_id", ""))
+            for row in gold.get("rows", [])
+            if row.get("cluster_id")
+        },
         run_binding_context=run_context,
         top_k=REVIEW_BASELINE_TOP_K,
     )
@@ -3828,6 +3828,32 @@ def _review_eval_run_metadata(
             splits or [],
         )
     return metadata
+
+
+def _review_eval_generated_binding_context(
+    corpus: Dict[str, Any],
+    run_metadata: Mapping[str, Any],
+    gold_mode: str | None = None,
+) -> Dict[str, Any]:
+    """Build the exact context hashed into generated-adjudication packets."""
+    return {
+        "corpus_binding_hash": _corpus_binding_hash(corpus),
+        "git_commit": run_metadata.get("git", {}).get("commit", "unknown"),
+        "routing": run_metadata.get("routing", {}),
+        "num_agents": run_metadata.get("num_agents", 0),
+        "reviewer_roles": run_metadata.get("reviewer_roles", {}),
+        "top_k": run_metadata.get("top_k", REVIEW_BASELINE_TOP_K),
+        "top_k_policy": run_metadata.get(
+            "top_k_policy", REVIEW_BASELINE_TOP_K_POLICY
+        ),
+        "memory_mode": run_metadata.get("memory_mode", "none"),
+        "gold_mode": (
+            gold_mode
+            if gold_mode is not None
+            else run_metadata.get("gold_mode", "complete")
+        ),
+        "benchmark_binding": run_metadata.get("benchmark_binding", {}),
+    }
 
 
 def _manifest_baseline_audit_errors(
@@ -4161,18 +4187,11 @@ async def run_historical_review_eval(
     run_binding_context: Dict[str, Any] | None = None
     if run_api and corpus.get("manifest_version"):
         adjudication_dir = Path(str(adjudication_path)).expanduser().resolve().parent
-        run_binding_context = {
-            "corpus_binding_hash": _corpus_binding_hash(corpus),
-            "git_commit": run_metadata["git"]["commit"],
-            "routing": run_metadata["routing"],
-            "num_agents": run_metadata["num_agents"],
-            "reviewer_roles": run_metadata["reviewer_roles"],
-            "top_k": REVIEW_BASELINE_TOP_K,
-            "top_k_policy": REVIEW_BASELINE_TOP_K_POLICY,
-            "memory_mode": memory_mode,
-            "gold_mode": gold_mode,
-            "benchmark_binding": run_metadata.get("benchmark_binding", {}),
-        }
+        run_binding_context = _review_eval_generated_binding_context(
+            corpus,
+            run_metadata,
+            gold_mode=gold_mode,
+        )
     issues_by_paper: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for issue in corpus.get("issues", []):
         issue_key = issue.get("case_id") or issue.get("paper_id", "")
@@ -9558,6 +9577,7 @@ __all__ = [
     "extract_text_from_paper_file",
     "prepare_review_adjudication",
     "finalize_review_evaluation",
+    "_review_eval_generated_binding_context",
     "portable_review_eval_result",
     "portable_review_prior_eval_gate_result",
     "run_historical_review_eval",
