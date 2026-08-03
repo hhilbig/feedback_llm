@@ -3264,6 +3264,7 @@ def _generated_issues_for_eval(
 REVIEW_PRIOR_EVAL_MODES = ("baseline", "safe_prior", "local_raw_memory")
 REVIEW_BASELINE_TOP_K = 5
 REVIEW_BASELINE_EXPECTED_CASES = 5
+REVIEW_BASELINE_TOP_K_POLICY = "up_to_k_missing_slots_count_as_misses"
 
 
 def _require_positive_finite_cost_ceiling(
@@ -3634,7 +3635,10 @@ def finalize_review_evaluation(
         "corpus_binding_hash": _corpus_binding_hash(corpus),
         "git_commit": run_metadata.get("git", {}).get("commit", "unknown"),
         "routing": run_metadata.get("routing", {}),
+        "num_agents": run_metadata.get("num_agents", 0),
+        "reviewer_roles": run_metadata.get("reviewer_roles", {}),
         "top_k": run_metadata.get("top_k", 5),
+        "top_k_policy": run_metadata.get("top_k_policy", ""),
         "memory_mode": run_metadata.get("memory_mode", "none"),
         "gold_mode": gold_mode,
         "benchmark_binding": run_metadata.get("benchmark_binding", {}),
@@ -3656,7 +3660,7 @@ def finalize_review_evaluation(
     )
     if generated.get("status") != "ready":
         raise ValueError(
-            "Generated top-five adjudication is not complete and current "
+            "Generated up-to-five adjudication is not complete and current "
             f"(status={generated.get('status', 'missing')})"
         )
     expected_case_keys = {
@@ -3671,11 +3675,12 @@ def finalize_review_evaluation(
         for row in generated.get("rows", [])
     )
     if set(generated_counts) != expected_case_keys or any(
-        count != REVIEW_BASELINE_TOP_K for count in generated_counts.values()
+        not 1 <= count <= REVIEW_BASELINE_TOP_K
+        for count in generated_counts.values()
     ):
         raise ValueError(
-            "Generated adjudication must contain exactly five rows for each of "
-            "the five expected cases"
+            "Generated adjudication must contain between one and five rows for "
+            "each of the five expected cases"
         )
     family_metadata: Dict[str, Dict[str, Any]] = {}
     cost_by_family: Dict[str, float] = {}
@@ -3683,9 +3688,14 @@ def finalize_review_evaluation(
         family_id = str(split.get("family_id", ""))
         if not family_id:
             continue
+        existing_family = family_metadata.get(family_id, {})
         family_metadata[family_id] = {
             "benchmark_tier": split.get("benchmark_tier", "primary"),
-            "is_journal_case": _split_is_journal_case(split),
+            "is_journal_case": bool(
+                existing_family.get("is_journal_case")
+                or _split_is_journal_case(split)
+            ),
+            "case_count": int(existing_family.get("case_count", 0)) + 1,
         }
         usage_cost = split.get("actual_usage", {}).get("total_cost_usd")
         cost_by_family[family_id] = float(
@@ -3699,6 +3709,11 @@ def finalize_review_evaluation(
         family_metadata=family_metadata,
         cost_by_family=cost_by_family,
         top_k=REVIEW_BASELINE_TOP_K,
+        output_cardinality_mode=(
+            "up_to_k"
+            if run_metadata.get("top_k_policy") == REVIEW_BASELINE_TOP_K_POLICY
+            else "exact_k"
+        ),
     )
     expected_metric_status = (
         "partial_gold_pilot" if gold_mode == "partial" else "complete"
@@ -3793,6 +3808,7 @@ def _review_eval_run_metadata(
             role: count * multiplier for role, count in sorted(role_counts.items())
         },
         "top_k": top_k,
+        "top_k_policy": REVIEW_BASELINE_TOP_K_POLICY,
         "importance_threshold": IMPORTANCE_THRESHOLD,
         "composite_threshold": COMPOSITE_THRESHOLD,
         "memory_mode": memory_mode,
@@ -3833,6 +3849,12 @@ def _manifest_baseline_audit_errors(
         errors.append("local audit corpus binding does not match the current corpus")
     if int(run_metadata.get("top_k", 0) or 0) != REVIEW_BASELINE_TOP_K:
         errors.append("manifest baseline must use top_k=5")
+    if int(run_metadata.get("num_agents", 0) or 0) != len(BASE_PERSONA_DECK):
+        errors.append("manifest baseline must use the frozen eight-reviewer design")
+    if run_metadata.get("top_k_policy") != REVIEW_BASELINE_TOP_K_POLICY:
+        errors.append(
+            "manifest baseline top-k policy does not match the current benchmark"
+        )
     if run_metadata.get("memory_mode") != "none":
         errors.append("manifest baseline must use memory_mode=none")
     if current_binding["expected_case_count"] != REVIEW_BASELINE_EXPECTED_CASES:
@@ -3875,8 +3897,11 @@ def _manifest_baseline_audit_errors(
             errors.append(f"case {key!r} was not API-evaluated successfully")
         if split.get("paper_text_status") != "ok":
             errors.append(f"case {key!r} did not have extractable manuscript text")
-        if int(split.get("generated_issue_count", 0) or 0) != REVIEW_BASELINE_TOP_K:
-            errors.append(f"case {key!r} does not contain exactly five generated issues")
+        generated_count = int(split.get("generated_issue_count", 0) or 0)
+        if not 1 <= generated_count <= REVIEW_BASELINE_TOP_K:
+            errors.append(
+                f"case {key!r} must contain between one and five generated issues"
+            )
     if len(split_keys) != len(set(split_keys)):
         errors.append("local audit contains duplicate case rows")
     if set(split_keys) != expected_keys:
@@ -4076,6 +4101,8 @@ async def run_historical_review_eval(
     corpus = load_review_corpus(archive_root, include_low_confidence=include_low_confidence)
     if gold_mode == "partial" and not corpus.get("manifest_version"):
         raise ValueError("Partial-gold evaluation requires a private manifest corpus")
+    if corpus.get("manifest_version") and num_agents != len(BASE_PERSONA_DECK):
+        raise ValueError("Manifest baseline evaluation requires exactly eight reviewers")
     if corpus.get("manifest_version") and top_k != REVIEW_BASELINE_TOP_K:
         raise ValueError("Manifest baseline evaluation requires top_k=5")
     if run_api and corpus.get("manifest_version"):
@@ -4120,6 +4147,32 @@ async def run_historical_review_eval(
                 "Paid manifest baseline is not the complete fixed pilot: "
                 + "; ".join(pilot_errors)
             )
+    run_metadata = _review_eval_run_metadata(
+        corpus,
+        routing=routing,
+        num_agents=num_agents,
+        top_k=top_k,
+        memory_mode=memory_mode,
+        splits=splits,
+        gold_mode=gold_mode,
+        gold_validation=gold_validation,
+    )
+    adjudication_dir: Path | None = None
+    run_binding_context: Dict[str, Any] | None = None
+    if run_api and corpus.get("manifest_version"):
+        adjudication_dir = Path(str(adjudication_path)).expanduser().resolve().parent
+        run_binding_context = {
+            "corpus_binding_hash": _corpus_binding_hash(corpus),
+            "git_commit": run_metadata["git"]["commit"],
+            "routing": run_metadata["routing"],
+            "num_agents": run_metadata["num_agents"],
+            "reviewer_roles": run_metadata["reviewer_roles"],
+            "top_k": REVIEW_BASELINE_TOP_K,
+            "top_k_policy": REVIEW_BASELINE_TOP_K_POLICY,
+            "memory_mode": memory_mode,
+            "gold_mode": gold_mode,
+            "benchmark_binding": run_metadata.get("benchmark_binding", {}),
+        }
     issues_by_paper: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for issue in corpus.get("issues", []):
         issue_key = issue.get("case_id") or issue.get("paper_id", "")
@@ -4263,6 +4316,21 @@ async def run_historical_review_eval(
                 if corpus.get("manifest_version")
                 else "api_evaluated"
             )
+            if (
+                run_binding_context is not None
+                and adjudication_dir is not None
+                and generated_for_adjudication
+            ):
+                from review_adjudication import write_generated_adjudication_packet
+
+                write_generated_adjudication_packet(
+                    generated_for_adjudication,
+                    gold_validation or {},
+                    adjudication_dir,
+                    run_binding_context=run_binding_context,
+                    top_k=REVIEW_BASELINE_TOP_K,
+                    prefix="generated_adjudication.in_progress",
+                )
         elif run_api:
             item["status"] = "skipped_no_extractable_paper_text"
         elif paper_text.strip():
@@ -4294,6 +4362,7 @@ async def run_historical_review_eval(
         "mode": "api" if run_api else "dry_run",
         "memory_mode": memory_mode,
         "gold_mode": gold_mode,
+        "top_k_policy": REVIEW_BASELINE_TOP_K_POLICY,
         "evaluation_scope": (
             gold_validation.get("evaluation_scope", "complete_gold_benchmark")
             if gold_validation is not None
@@ -4380,16 +4449,7 @@ async def run_historical_review_eval(
         ),
         "summary": summary,
         "splits": split_results,
-        "run_metadata": _review_eval_run_metadata(
-            corpus,
-            routing=routing,
-            num_agents=num_agents,
-            top_k=top_k,
-            memory_mode=memory_mode,
-            splits=splits,
-            gold_mode=gold_mode,
-            gold_validation=gold_validation,
-        ),
+        "run_metadata": run_metadata,
     }
     if gold_validation is not None:
         result["gold_adjudication"] = {
@@ -4402,14 +4462,55 @@ async def run_historical_review_eval(
             "coverage": dict(gold_validation.get("coverage", {})),
         }
     if run_api and corpus.get("manifest_version"):
-        from review_adjudication import write_generated_adjudication_packet
+        from review_adjudication import (
+            generated_binding_hash,
+            select_generated_top_k,
+            write_generated_adjudication_packet,
+        )
 
-        adjudication_dir = Path(str(adjudication_path)).expanduser().resolve().parent
+        if adjudication_dir is None or run_binding_context is None:
+            raise RuntimeError("Paid manifest checkpoint context was not initialized")
+        if generated_for_adjudication:
+            checkpoint_issues = select_generated_top_k(
+                generated_for_adjudication,
+                top_k=REVIEW_BASELINE_TOP_K,
+            )
+            checkpoint_binding = generated_binding_hash(
+                checkpoint_issues,
+                (gold_validation or {}).get("binding_hash", ""),
+                run_binding_context,
+                REVIEW_BASELINE_TOP_K,
+            )
+            checkpoint_packet = write_generated_adjudication_packet(
+                checkpoint_issues,
+                gold_validation or {},
+                adjudication_dir,
+                run_binding_context=run_binding_context,
+                top_k=REVIEW_BASELINE_TOP_K,
+                prefix=(
+                    "generated_adjudication.checkpoint."
+                    f"{checkpoint_binding[:16]}"
+                ),
+            )
+            if checkpoint_packet.get("binding_hash") != checkpoint_binding:
+                raise RuntimeError("Generated checkpoint binding is inconsistent")
+            result["generated_checkpoint"] = {
+                "binding_hash": checkpoint_packet.get("binding_hash"),
+                "issue_count": checkpoint_packet.get("row_count", 0),
+                "csv_path": checkpoint_packet.get("csv_path"),
+                "markdown_path": checkpoint_packet.get("markdown_path"),
+            }
+        else:
+            result["generated_checkpoint"] = {
+                "status": "not_created_no_generated_issues",
+                "issue_count": 0,
+            }
         audit_errors = _manifest_baseline_audit_errors(corpus, result)
         if audit_errors:
             result["status"] = "incomplete_run"
             result["generated_adjudication"] = {
                 "status": "not_created_incomplete_run",
+                "checkpoint_only": bool(generated_for_adjudication),
                 "errors": audit_errors,
             }
         else:
@@ -4417,17 +4518,7 @@ async def run_historical_review_eval(
                 generated_for_adjudication,
                 gold_validation or {},
                 adjudication_dir,
-                run_binding_context={
-                    "corpus_binding_hash": _corpus_binding_hash(corpus),
-                    "git_commit": result["run_metadata"]["git"]["commit"],
-                    "routing": result["run_metadata"]["routing"],
-                    "top_k": REVIEW_BASELINE_TOP_K,
-                    "memory_mode": memory_mode,
-                    "gold_mode": gold_mode,
-                    "benchmark_binding": result["run_metadata"].get(
-                        "benchmark_binding", {}
-                    ),
-                },
+                run_binding_context=run_binding_context,
                 top_k=REVIEW_BASELINE_TOP_K,
             )
             result["generated_adjudication"] = {
@@ -4804,6 +4895,7 @@ def render_historical_review_eval_summary(result: Dict[str, Any]) -> str:
         f"- Mode: {summary.get('mode', 'dry_run')}",
         f"- Review-memory mode: {summary.get('memory_mode', 'local_raw')}",
         f"- Gold mode: {summary.get('gold_mode', 'complete')}",
+        f"- Output cardinality: {summary.get('top_k_policy', 'exact_k')}",
         f"- Evaluation scope: {summary.get('evaluation_scope', 'not_loaded')}",
         f"- Corpus records: {summary.get('corpus_records', 0)}",
         f"- Corpus issue candidates: {summary.get('corpus_issue_candidates', 0)}",
@@ -9846,7 +9938,7 @@ def main(argv: List[str] | None = None) -> int:
         "--eval-generated-adjudication",
         type=str,
         default=None,
-        help="Completed generated top-five adjudication CSV used to finalize metrics.",
+        help="Completed generated up-to-five adjudication CSV used to finalize metrics.",
     )
     parser.add_argument(
         "--finalize-review-eval",

@@ -225,12 +225,23 @@ screens as coverage, and never describes major-cluster recall as exhaustive.
 Changing a completed label or completing another row changes the partial binding
 and invalidates any generated-issue packet from the earlier state.
 
-After a paid run, every final top-five generated issue receives manual labels for
-correctness, significance, evidence support, duplication, human-cluster match,
-and valid novelty. The paid result remains `pending_human_adjudication` until
-those labels are complete. Manifest runs do not calculate provisional recall
-against raw feedback; scoring begins only after these manual labels are complete.
-Changing a source, extraction rule, manuscript, or cluster invalidates the
-corresponding labels.
+After a paid run, every real final post-verification issue, up to five per case,
+receives manual labels for correctness, significance, evidence support,
+duplication, human-cluster match, and valid novelty. A successful benchmark case
+must return at least one issue; the runner never creates placeholder rows. Missing
+slots count as misses for supported-significant precision@5 and valid-novelty
+yield@5. Recall keeps the human-cluster denominator, and duplicate rate is
+calculated among returned issues only.
+
+The runner atomically rewrites a private in-progress packet after each completed
+case and creates a content-addressed private checkpoint before the final audit.
+The canonical `generated_adjudication.csv` is written only after all run gates
+pass. Generated text and evidence IDs therefore remain recoverable after an
+interruption or failed audit but never enter portable output. A completed paid
+result remains `pending_human_adjudication` until every returned issue is labeled.
+Manifest runs do not calculate provisional recall against raw feedback; scoring
+begins only after these manual labels are complete. Changing a source, extraction
+rule, manuscript, cluster, output-cardinality policy, or generated issue
+invalidates the corresponding labels.
 
 See [DESIGN.md](DESIGN.md) for implementation details.

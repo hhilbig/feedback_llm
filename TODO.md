@@ -18,12 +18,21 @@ cluster rows. All 36 rows that currently require full adjudication are complete;
 tier-screened minor rows outside the deterministic sample. The remaining 93
 rows still need a tier screen before the strict benchmark can run.
 
-The cold-baseline dry run estimated a total API cost of $9.7836 and made no API
-calls. This estimate exceeds the previously discussed $2--$3 range, so no paid
-run is authorized. The German AJPS source required one additional safeguard:
-only verbatim reviewer passages were transcribed from the response memo. Author
-responses and the merged resubmission remain hash-bound deferred sources and
-are not evaluation targets.
+The cold-baseline dry run estimated a total API cost of $9.7836. The first paid
+attempt cost $9.8542 and kept historical feedback out of every prompt. It returned
+5, 5, 4, 4, and 5 final issues across the five cases. The old exact-five audit gate
+therefore marked the run incomplete even though all manuscripts were evaluated.
+That attempt retained cost and run metadata but not enough untruncated issue text
+to create a defensible adjudication packet.
+
+The benchmark now accepts one to five real final issues per case. Missing slots
+count as misses for supported-significant precision@5 and valid-novelty yield@5;
+duplicate rate remains conditional on returned issues. The runner writes a private
+full-text checkpoint after each completed case and before the final audit. A fresh
+five-manuscript rerun is authorized with a $10 ceiling. The German AJPS source
+still includes only verbatim reviewer passages from the response memo. Author
+responses and the merged resubmission remain hash-bound deferred sources and are
+not evaluation targets.
 
 ## Implemented
 
@@ -37,10 +46,13 @@ are not evaluation targets.
    clustering, major-cluster screening, and a five-minor-cluster sample per
    family using seed `20260802`.
 4. Hash-bound private gold and generated-issue adjudication packets. Changes to
-   source content, extraction rules, cluster membership, or baseline output
-   invalidate the corresponding labels.
+   source content, extraction rules, cluster membership, output-cardinality
+   policy, or baseline output invalidate the corresponding labels. Incremental
+   and content-addressed checkpoints preserve full generated text and evidence
+   IDs without entering portable output.
 5. Cold evaluation mode that passes neither a review corpus nor a reviewer
-   prior to the pipeline and scores only the final post-verification top five.
+   prior to the pipeline and scores only the final post-verification issues, up
+   to five per case.
 6. Zero-call dry runs, finite positive cost ceilings, complete preflight cost
    checks, fixed pilot-composition checks before the first request, and
    remaining-budget checks before later cases.
@@ -52,6 +64,9 @@ are not evaluation targets.
 9. An explicit partial-gold pilot mode that freezes completed labels, scores only
    the 30 fully adjudicated included clusters, and labels major recall as
    non-exhaustive. The strict complete-gold gate remains the default.
+10. An up-to-five output policy with fixed five-slot denominators for supported
+    precision and novelty yield, unchanged human-cluster recall denominators,
+    and returned-issue denominators for duplicate rates.
 
 ## Source Freeze
 
@@ -65,14 +80,17 @@ are not evaluation targets.
 
 ## Next Validation Gate
 
-1. Re-run the zero-call estimate with `--eval-gold-mode partial` and record its
-   52/145 completed-row coverage and 30-cluster scoring denominator.
-2. Obtain explicit approval for that exact total. The previous estimate was
-   $9.7836; no paid run is authorized yet.
-3. Commit the implementation so the paid run has a clean, frozen code state.
-4. Run the partial paid pilot only if its current binding matches the dry plan
-   and the estimate is below the approved ceiling.
-5. Label every generated top-five issue, then finalize explicitly partial,
+1. Run the full offline suite and commit the output-policy and checkpoint change
+   so the rerun has a clean, frozen code state.
+2. Re-run the zero-call partial-gold estimate. Proceed only if the current corpus
+   and gold bindings remain valid and the estimate is below the approved $10
+   ceiling.
+3. Run the authorized five-manuscript cold baseline and verify that all five cases
+   finish, actual cost stays below $10, and every split records zero review-memory
+   inputs.
+4. Verify the canonical generated packet, content-addressed checkpoint, private
+   permissions, portable-output redaction, and binding consistency.
+5. Label every returned generated issue, then finalize explicitly partial,
    non-exhaustive major-recall results plus sampled-minor, precision, novelty,
    duplicate, and cost metrics.
 6. Screen the remaining 93 rows later if an exhaustive benchmark is still worth

@@ -183,12 +183,14 @@ available. The implementation:
   matcher: weighted issue-concept/token features retrieve the nearest held-out
   review issue, and a rule-based verifier labels matched, partially matched, or
   novel/unmatched issues. Manifest benchmarks do not use this provisional
-  comparison because their generated top-five issues require manual labels.
+  comparison because their generated issues require manual labels.
 - Provides a whole-paper held-out eval harness through
   `run_historical_review_eval()`. Manifest splits exclude the complete manuscript
   family; legacy splits retain paper-ID fallback behavior. The cold baseline passes
   `review_corpus=None` and `review_prior=None` explicitly. It scores the final
-  post-verification `top_proposals[:5]`, not the larger candidate pool.
+  post-verification `top_proposals[:5]`, not the larger candidate pool. A
+  successful manifest case may return one to five real issues; the evaluator
+  never pads a short result with placeholder rows.
 - Plans every selected case and totals its estimated cost before any API request.
   Paid mode requires a positive cost ceiling and checks the remaining allowance
   before each case. A paid pilot rejects partial selections and requires the fixed
@@ -232,14 +234,30 @@ canonical wording, severity, evidentiary support, duplicate corrections, and an
 exclusion reason where relevant. Its binding hash changes when source content,
 manuscript content, extraction rules, or cluster membership changes.
 
-After a paid run, a second packet contains the final five generated issues per case.
-Every row requires correctness, significance, evidence sufficiency, match status,
-duplicate status, and valid-novelty labels. Lexical matching supplies suggestions
-only. An unmatched generated concern is not counted as false until a person labels
-it. A completed paid generation run remains `pending_human_adjudication` until
-all top-five labels are current; incomplete family runs cannot reach that state.
-Final aggregate metrics are produced only when the generated packet is current
-and complete. In complete-gold mode, the gold packet must also contain every tier
+After a paid run, a second packet contains the final post-verification issues, up
+to five per case. Every row requires correctness, significance, evidence
+sufficiency, match status, duplicate status, and valid-novelty labels. Lexical
+matching supplies suggestions only. An unmatched generated concern is not counted
+as false until a person labels it. Each successful case must contain one to five
+contiguously ranked issues; no synthetic fifth row is added.
+
+The benchmark treats each case as five available output slots. Missing slots count
+as misses for supported-significant precision@5 and valid-novelty yield@5. Human
+cluster recall keeps its human-target denominator, while duplicate rate uses only
+the issues actually returned. The run metadata and generated-packet binding include
+this output-cardinality policy.
+
+After every completed case, the runner atomically rewrites a private in-progress
+packet containing full issue text and evidence IDs. After all cases finish, it
+writes a content-addressed checkpoint before applying the final run audit. A failed
+audit does not create or replace the canonical packet, but its checkpoint remains
+available locally. Neither checkpoint metadata nor checkpoint content enters the
+portable projection.
+
+A completed paid generation run remains `pending_human_adjudication` until all
+returned issue labels are current; incomplete family runs cannot reach that state.
+Final aggregate metrics are produced only when the generated packet is current and
+complete. In complete-gold mode, the gold packet must also contain every tier
 screen; results report family-macro major-cluster recall, the journal-only subset,
 sampled-minor recall, supported-significant precision, valid-novelty yield,
 duplicate rate, and cost. Secondary cases remain outside the primary aggregate.
@@ -549,5 +567,5 @@ Current test modules cover:
 - mocked end-to-end pipeline behavior
 - manifest validation, PDF/Word/text extraction, source deduplication, ordered
   manuscript bundles, dataless cloud rejection, and legacy-loader compatibility
-- family-level leakage controls, cold-baseline prompt isolation, top-five scoring,
+- family-level leakage controls, cold-baseline prompt isolation, up-to-five scoring,
   cost ceilings, portable output privacy, and deterministic adjudication artifacts

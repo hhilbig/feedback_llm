@@ -1333,6 +1333,7 @@ def generated_binding_hash(
             "case_id": _case_id(issue),
             "rank": int(issue["rank"]),
             "generated_issue_id": _generated_id(issue),
+            "pipeline_issue_id": _clean(issue.get("id")),
             "text": _issue_text(issue),
             "evidence_ids": issue.get("evidence_ids", []),
         }
@@ -1404,7 +1405,7 @@ def write_generated_adjudication_packet(
     markdown_path = output / f"{prefix}.md"
     _write_csv(csv_path, GENERATED_COLUMNS, rows)
     lines = [
-        "# Generated top-five adjudication",
+        "# Generated up-to-five adjudication",
         "",
         f"- Packet version: `{PACKET_VERSION}`",
         f"- Binding hash: `{binding}`",
@@ -1449,6 +1450,7 @@ def validate_generated_rows(
     expected_gold_binding_hash: str | None = None,
     expected_generated_issue_ids: Iterable[str] | None = None,
     valid_gold_cluster_ids: Iterable[str] | None = None,
+    top_k: int | None = None,
 ) -> Dict[str, Any]:
     """Validate all manual labels in a generated top-K packet."""
     errors: List[str] = []
@@ -1484,6 +1486,7 @@ def validate_generated_rows(
         stale = True
         errors.append("packet generated-issue set does not match current baseline output")
     rank_keys: set[Tuple[str, str, int]] = set()
+    ranks_by_case: Dict[Tuple[str, str], set[int]] = defaultdict(set)
     gold_ids = set(valid_gold_cluster_ids or [])
     for row in rows:
         issue_id = _clean(row.get("generated_issue_id")) or "<missing>"
@@ -1491,14 +1494,18 @@ def validate_generated_rows(
         if not rank_text.isdigit() or int(rank_text) <= 0:
             errors.append(f"{issue_id}: rank must be a positive integer")
         else:
+            rank_value = int(rank_text)
             rank_key = (
                 _clean(row.get("family_id")),
                 _clean(row.get("case_id")),
-                int(rank_text),
+                rank_value,
             )
             if rank_key in rank_keys:
                 errors.append(f"{issue_id}: rank must be unique within family/case")
             rank_keys.add(rank_key)
+            ranks_by_case[rank_key[:2]].add(rank_value)
+            if top_k is not None and rank_value > top_k:
+                errors.append(f"{issue_id}: rank must not exceed top_k={top_k}")
         checks = {
             "correctness": CORRECTNESS_VALUES,
             "significance": SIGNIFICANCE_VALUES,
@@ -1539,6 +1546,14 @@ def validate_generated_rows(
                 errors.append(f"{issue_id}: valid novelty must be correct")
             if _clean(row.get("evidence_sufficiency")).lower() != "sufficient":
                 errors.append(f"{issue_id}: valid novelty must have sufficient evidence")
+
+    if top_k is not None:
+        for case_key, ranks in sorted(ranks_by_case.items()):
+            expected_ranks = set(range(1, len(ranks) + 1))
+            if ranks != expected_ranks:
+                errors.append(
+                    f"case {case_key!r}: ranks must be contiguous from 1"
+                )
 
     if stale:
         status = "stale"
@@ -1630,6 +1645,7 @@ def load_generated_adjudication(
         expected_gold_binding_hash=expected_gold_binding_hash,
         expected_generated_issue_ids=expected_ids,
         valid_gold_cluster_ids=valid_gold_cluster_ids,
+        top_k=top_k,
     )
     if selected is not None:
         expected = {
@@ -1743,6 +1759,7 @@ def _family_metadata(
         "public_family_id": _clean(item.get("public_family_id")) or "F_" + stable_hash(family_id)[:8],
         "benchmark_tier": _clean(item.get("benchmark_tier")).lower() or "primary",
         "is_journal_case": is_journal,
+        "case_count": max(1, int(item.get("case_count", 1) or 1)),
     }
 
 
@@ -1753,6 +1770,7 @@ def compute_privacy_safe_metrics(
     family_metadata: Mapping[str, Mapping[str, Any]] | None = None,
     cost_by_family: Mapping[str, float] | None = None,
     top_k: int = 5,
+    output_cardinality_mode: str = "exact_k",
 ) -> Dict[str, Any]:
     """Compute aggregate metrics after both human-adjudication gates pass.
 
@@ -1760,6 +1778,8 @@ def compute_privacy_safe_metrics(
     counts, rates, cost numbers, and status.  It never copies issue text,
     reviewer IDs, locators, evidence text, or filesystem paths.
     """
+    if output_cardinality_mode not in {"exact_k", "up_to_k"}:
+        raise ValueError("output_cardinality_mode must be one of: exact_k, up_to_k")
     if gold_validation.get("status") != "ready" or generated_validation.get("status") != "ready":
         pending_result = {
             "status": "pending_human_adjudication",
@@ -1789,7 +1809,12 @@ def compute_privacy_safe_metrics(
         if rank.isdigit() and int(rank) <= top_k:
             generated_rows.append(row)
     families = sorted(
-        {_clean(row.get("family_id")) for row in gold_rows + generated_rows if _clean(row.get("family_id"))}
+        (set(metadata) if output_cardinality_mode == "up_to_k" else set())
+        | {
+            _clean(row.get("family_id"))
+            for row in gold_rows + generated_rows
+            if _clean(row.get("family_id"))
+        }
     )
 
     confirmed_by_family: Dict[str, set[str]] = defaultdict(set)
@@ -1826,6 +1851,11 @@ def compute_privacy_safe_metrics(
             1 for row in family_generated if _clean(row.get("duplicate_status")).lower() == "duplicate"
         )
         count = len(family_generated)
+        evaluation_slots = (
+            top_k * meta["case_count"]
+            if output_cardinality_mode == "up_to_k"
+            else count
+        )
         per_family.append(
             {
                 "family_id": meta["public_family_id"],
@@ -1840,10 +1870,14 @@ def compute_privacy_safe_metrics(
                     len(sampled_minor_ids & matched), len(sampled_minor_ids)
                 ),
                 "generated_issue_count": count,
+                "evaluation_slot_count": evaluation_slots,
+                "unfilled_issue_slot_count": max(0, evaluation_slots - count),
                 "supported_significant_issue_count": supported_significant,
-                "supported_significant_precision_at_5": _safe_ratio(supported_significant, count),
+                "supported_significant_precision_at_5": _safe_ratio(
+                    supported_significant, evaluation_slots
+                ),
                 "valid_novel_issue_count": novel,
-                "valid_novelty_yield_at_5": _safe_ratio(novel, count),
+                "valid_novelty_yield_at_5": _safe_ratio(novel, evaluation_slots),
                 "duplicate_issue_count": duplicates,
                 "duplicate_rate_at_5": _safe_ratio(duplicates, count),
                 "cost_usd": round(float(costs.get(family, 0.0)), 6),
@@ -1854,16 +1888,24 @@ def compute_privacy_safe_metrics(
     journal = [row for row in primary if row["is_journal_case"]]
     secondary = [row for row in per_family if row["benchmark_tier"] != "primary"]
     primary_generated = sum(row["generated_issue_count"] for row in primary)
+    primary_slots = sum(row["evaluation_slot_count"] for row in primary)
     primary_supported = sum(row["supported_significant_issue_count"] for row in primary)
     primary_novel = sum(row["valid_novel_issue_count"] for row in primary)
     primary_duplicates = sum(row["duplicate_issue_count"] for row in primary)
     all_generated = sum(row["generated_issue_count"] for row in per_family)
+    all_slots = sum(row["evaluation_slot_count"] for row in per_family)
     all_supported = sum(row["supported_significant_issue_count"] for row in per_family)
     all_novel = sum(row["valid_novel_issue_count"] for row in per_family)
     all_duplicates = sum(row["duplicate_issue_count"] for row in per_family)
     result = {
         "status": "complete",
         "top_k": top_k,
+        "output_cardinality_mode": output_cardinality_mode,
+        "missing_slot_policy": (
+            "count_as_miss_for_supported_precision_and_novelty_yield"
+            if output_cardinality_mode == "up_to_k"
+            else "not_applicable"
+        ),
         "primary_family_count": len(primary),
         "secondary_family_count": len(secondary),
         "primary_family_macro_major_cluster_recall_at_5": _macro(
@@ -1876,14 +1918,19 @@ def compute_privacy_safe_metrics(
             row["sampled_minor_cluster_recall_at_5"] for row in primary
         ),
         "primary_supported_significant_precision_at_5": _safe_ratio(
-            primary_supported, primary_generated
+            primary_supported, primary_slots
         ),
-        "primary_valid_novelty_yield_at_5": _safe_ratio(primary_novel, primary_generated),
+        "primary_valid_novelty_yield_at_5": _safe_ratio(primary_novel, primary_slots),
         "primary_duplicate_rate_at_5": _safe_ratio(primary_duplicates, primary_generated),
-        "all_family_supported_significant_precision_at_5": _safe_ratio(all_supported, all_generated),
-        "all_family_valid_novelty_yield_at_5": _safe_ratio(all_novel, all_generated),
+        "all_family_supported_significant_precision_at_5": _safe_ratio(all_supported, all_slots),
+        "all_family_valid_novelty_yield_at_5": _safe_ratio(all_novel, all_slots),
         "all_family_duplicate_rate_at_5": _safe_ratio(all_duplicates, all_generated),
         "total_generated_issue_count": all_generated,
+        "primary_evaluation_slot_count": primary_slots,
+        "all_family_evaluation_slot_count": all_slots,
+        "total_unfilled_issue_slot_count": sum(
+            row["unfilled_issue_slot_count"] for row in per_family
+        ),
         "total_cost_usd": round(sum(float(costs.get(family, 0.0)) for family in families), 6),
         "families": per_family,
     }
@@ -1893,6 +1940,7 @@ def compute_privacy_safe_metrics(
         result["denominator_scope"] = "adjudicated_clusters_only"
         result["exhaustive_major_recall"] = False
         result["novelty_reference_scope"] = "partial_gold_plus_manual_judgment"
+        result["top_k_policy"] = output_cardinality_mode
         result["gold_coverage"] = dict(gold_validation.get("coverage", {}))
         result[
             "adjudicated_subset_primary_family_macro_major_cluster_recall_at_5"
@@ -1910,6 +1958,10 @@ def compute_privacy_safe_metrics(
             family["adjudicated_major_cluster_recall_at_5"] = family.pop(
                 "major_cluster_recall_at_5"
             )
+            if output_cardinality_mode == "up_to_k":
+                family["duplicate_rate_among_returned_at_5"] = family.pop(
+                    "duplicate_rate_at_5"
+                )
         result["primary_families_with_adjudicated_major_denominator"] = sum(
             row["benchmark_tier"] == "primary"
             and row["adjudicated_major_cluster_count"] > 0
@@ -1921,6 +1973,13 @@ def compute_privacy_safe_metrics(
             and row["adjudicated_major_cluster_count"] > 0
             for row in result["families"]
         )
+        if output_cardinality_mode == "up_to_k":
+            result["primary_duplicate_rate_among_returned_at_5"] = result.pop(
+                "primary_duplicate_rate_at_5"
+            )
+            result["all_family_duplicate_rate_among_returned_at_5"] = result.pop(
+                "all_family_duplicate_rate_at_5"
+            )
     return result
 
 
